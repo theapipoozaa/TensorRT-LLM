@@ -138,6 +138,7 @@ void RuntimeBuffers::create(TllmRuntime& runtime, GptModelConfig const& modelCon
 
     if (modelConfig.usePagedKvCache())
     {
+        std::cout << "hh inserting kv_cache_block_pointers_" << std::to_string(firstLayerId) << std::endl;
         auto const kvCacheBlockPointersType
             = engine.getTensorDataType(("kv_cache_block_pointers_" + std::to_string(firstLayerId)).c_str());
         kvCacheBlockPointersHost = manager.emptyTensor(MemoryType::kCPU, kvCacheBlockPointersType);
@@ -195,7 +196,7 @@ void RuntimeBuffers::createCustomAllReduceWorkspace(SizeType maxBatchSize, SizeT
 
     commPtrs = manager.cpu(
         ITensor::makeShape({static_cast<SizeType>(mIpcMemoryHandles.size()) * worldConfig.getTensorParallelism()}),
-        nvinfer1::DataType::kINT64);
+        nvinfer1::DataType::kINT32);
     const auto commPtrsData = bufferCast<void*>(*commPtrs);
 
     for (size_t memIdx = 0; memIdx < mIpcMemoryHandles.size(); memIdx++)
