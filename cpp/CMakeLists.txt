@@ -152,6 +152,7 @@ find_library(RT_LIB rt)
 
 set_ifndef(ENABLE_MULTI_DEVICE 1)
 if(ENABLE_MULTI_DEVICE EQUAL 1)
+  message("Multi-device enabled")
   # NCCL dependencies
   set_ifndef(NCCL_LIB_DIR /usr/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu/)
   set_ifndef(NCCL_INCLUDE_DIR /usr/include/)
@@ -257,6 +258,8 @@ if(BUILD_PYT)
   message(STATUS "Found Python libraries at ${Python3_LIBRARY_DIRS}")
   link_directories("${Python3_LIBRARY_DIRS}")
   list(APPEND COMMON_HEADER_DIRS ${Python3_INCLUDE_DIRS})
+  list(APPEND CMAKE_PREFIX_PATH "/usr/local/lib/python3.10/dist-packages/pybind11")
+  find_package(pybind11 REQUIRED)
 
   execute_process(
     COMMAND
@@ -325,3 +328,22 @@ if(BUILD_BENCHMARKS)
   add_subdirectory(${TRT_LLM_ROOT_DIR}/benchmarks/cpp
                    ${CMAKE_BINARY_DIR}/benchmarks)
 endif()
+
+pybind11_add_module(pygptmanager ${CMAKE_SOURCE_DIR}/tensorrt_llm/common/pygptmanager.cpp)
+include_directories(${CMAKE_SOURCE_DIR}/include)
+
+add_library(tensorrt_llm_batch_manager STATIC IMPORTED)
+set_property(
+  TARGET tensorrt_llm_batch_manager
+  PROPERTY
+    IMPORTED_LOCATION
+    "${CMAKE_SOURCE_DIR}/tensorrt_llm/batch_manager/x86_64-linux-gnu/libtensorrt_llm_batch_manager_static.a"
+)
+target_link_libraries(
+  pygptmanager
+  PRIVATE tensorrt_llm_batch_manager
+          tensorrt_llm
+          ${MPI_LIBRARIES}
+          nvinfer
+          nvinfer_plugin_tensorrt_llm
+          nccl)
