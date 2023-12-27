@@ -99,7 +99,7 @@ def fused_attention_kernel(
     offs_n = tl.arange(0, BLOCK_DMODEL)
     off_o = off_hz * stride_h + offs_m[:, None] * BLOCK_DMODEL + offs_n[None, :]
     out_ptrs = Out + off_o
-    tl.store(out_ptrs, acc)
+    tl.store(out_ptrs, acc, mask=offs_m[:, None] < seq_len)
 
 
 def fused_attention(q, k, v, sm_scale, o_buf=None, l_buf=None, m_buf=None):
