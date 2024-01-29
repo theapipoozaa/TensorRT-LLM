@@ -26,8 +26,10 @@ You can clone this repository using [Git for Windows](https://git-scm.com/downlo
 
 We provide a Powershell script, `setup_env.ps1`, which installs Python, CUDA 12.2, and Microsoft MPI automatically with default settings. Be sure to run Powershell as Administrator to use the script. Usage:
 
+
 ```
-./setup_env.ps1 [-skipCUDA] [-skipPython] [-skipMPI]
+cd TensorRT-LLM
+./windows/setup_env.ps1 [-skipCUDA] [-skipPython] [-skipMPI]
 ```
 
 Close and reopen Powershell after running the script so that `Path` changes take effect. The script will install whichever components are not skipped. Any components may be installed manually instead of using the script. Further, cuDNN **must** be installed manually. For more details about manually installing prerequisites, check the [Detailed Setup](#detailed-setup) instructions below.
