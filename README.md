@@ -106,7 +106,8 @@ After installing the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacent
 please run the following commands to install TensorRT-LLM for x86_64 users.
 
 ```bash
-# Obtain and start the basic docker image environment
+# Please use the `nvidia-docker` application, using only `docker` may cause exceptions.
+# Obtain and start the basic docker image environment.
 nvidia-docker run --entrypoint /bin/bash -it nvidia/cuda:12.1.0-devel-ubuntu22.04
 
 # Install dependencies, TensorRT-LLM requires Python 3.10
@@ -118,7 +119,7 @@ apt-get update && apt-get -y install python3.10 python3-pip openmpi-bin libopenm
 pip3 install tensorrt_llm -U --pre --extra-index-url https://pypi.nvidia.com
 
 # Check installation
-python3 -c "import tensorrt_llm; print(tensorrt_llm.__version__)"
+python3 -c "import tensorrt_llm"
 ```
 
 For developers who have the best performance requirements, debugging needs, or use the aarch64 architecture,
@@ -167,8 +168,8 @@ python convert_checkpoint.py --model_dir ./bloom/560M/ \
                 --output_dir ./bloom/560M/trt_ckpt/fp16/1-gpu/
 # May need to add trtllm-build to PATH, export PATH=/usr/local/bin:$PATH
 trtllm-build --checkpoint_dir ./bloom/560M/trt_ckpt/fp16/1-gpu/ \
-                --use_gemm_plugin float16 \
-                --use_gpt_attention_plugin float16 \
+                --gemm_plugin float16 \
+                --gpt_attention_plugin float16 \
                 --output_dir ./bloom/560M/trt_engines/fp16/1-gpu/
 ```
 
@@ -264,7 +265,7 @@ The list of supported models is:
 
 * [Baichuan](examples/baichuan)
 * [BART](examples/enc_dec)
-* [Bert](examples/bert)
+* [BERT](examples/bert)
 * [Blip2](examples/blip2)
 * [BLOOM](examples/bloom)
 * [ChatGLM](examples/chatglm)
@@ -286,6 +287,7 @@ The list of supported models is:
 * [Phi-1.5/Phi-2](examples/phi)
 * [Qwen](examples/qwen)
 * [Replit Code](examples/mpt)
+* [RoBERTa](examples/bert)
 * [SantaCoder](examples/gpt)
 * [StarCoder](examples/gpt)
 * [T5](examples/enc_dec)
