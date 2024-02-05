@@ -28,7 +28,9 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#ifdef __unix__
 #include <sys/sysinfo.h>
+#endif
 #include <vector>
 
 namespace tensorrt_llm::common
@@ -276,6 +278,7 @@ inline std::tuple<size_t, size_t> getDeviceMemoryInfo(const bool useUvm)
 {
     if (useUvm)
     {
+#ifdef __unix__
         size_t freeSysmem, totalSysmem;
         struct sysinfo info;
         sysinfo(&info);
@@ -284,6 +287,9 @@ inline std::tuple<size_t, size_t> getDeviceMemoryInfo(const bool useUvm)
         TLLM_LOG_DEBUG("Using UVM based system memory for KV cache, total memory %0.2f GB, available memory %0.2f GB",
             ((double) totalSysmem / 1e9), ((double) freeSysmem / 1e9));
         return {freeSysmem, totalSysmem};
+#else
+        // Windows equivalent code here
+#endif
     }
     else
     {
