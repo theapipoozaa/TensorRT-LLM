@@ -92,7 +92,8 @@ GptDecoderBatch::GptDecoderBatch(std::size_t vocabSize, std::size_t vocabSizePad
     auto& dInput = mJointDecodingInput;
     auto dummyLogits = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
     auto endIds = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
-    dInput = std::make_unique<DecodingInput>(0, 0, 0, 0, std::move(dummyLogits), std::move(endIds));
+    auto minPs = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
+    dInput = std::make_unique<DecodingInput>(0, 0, 0, 0, std::move(dummyLogits), std::move(endIds), std::move(minPs));
 
     dInput->sequenceLimitLength = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
     dInput->lengths = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
@@ -226,6 +227,7 @@ void GptDecoderBatch::setup(executor::DecodingMode const& mode, SizeType32 maxBa
     dInput.maxAttentionWindow = mMaxAttentionWindow;
     dInput.sinkTokenLength = mSinkTokenLength;
     const_cast<ITensor&>(*dInput.endIds).reshape(maxBatchSizeXmaxBeamWidth);
+    const_cast<ITensor&>(*dInput.minPs).reshape(maxBatchSizeXmaxBeamWidth);
     auto& sequenceLimitLength = const_cast<ITensor&>(*dInput.sequenceLimitLength);
     sequenceLimitLength.reshape(maxBatchSizeShape);
     kernels::invokeFill(sequenceLimitLength, mMaxSequenceLength, *mStream);
@@ -438,8 +440,23 @@ void GptDecoderBatch::newRequest(
 
     TensorPtr endIdTensorPtr{ITensor::slice(constPointerCast(dJointInput.endIds), batchIdx, localBatchSize)};
     kernels::invokeFill(*endIdTensorPtr, endId, *stream);
+    TensorPtr minPTensorPtr{ITensor::slice(constPointerCast(dJointInput.minPs), batchIdx, localBatchSize)};
+    int wordsLen = 0;
+    if (request.badWordsList)
+    {
+        wordsLen = request.badWordsList->getShape().d[1];
+    }
+
+    if (wordsLen > 0)
+    {
+        // copying int bits to float: avoid the type check in ::copy(ITensor, ITensor)
+        manager.copy(request.badWordsList->data(), *minPTensorPtr, request.badWordsList->getMemoryType());
+    } else {
+        kernels::invokeFill(*minPTensorPtr, 0.0f, *stream);
+    }
+
     dInput = std::make_unique<DecodingInput>(
-        inputLength, mMaxAttentionWindow, mSinkTokenLength, localBatchSize, dJointInput.logits, endIdTensorPtr);
+        inputLength, mMaxAttentionWindow, mSinkTokenLength, localBatchSize, dJointInput.logits, endIdTensorPtr, minPTensorPtr);
 
     TensorPtr embeddingBiasSlice
         = ITensor::slice(constPointerCast(dJointInput.embeddingBias), batchIdx, localBatchSize);

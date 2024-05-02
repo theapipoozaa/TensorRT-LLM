@@ -52,6 +52,7 @@ struct BeamHypotheses
     // Pointers from input
     int const* inputLengths{nullptr};   // [BS, BM]         %% context_length
     int const* endIds{nullptr};         // [BS, BM]         %% self.end_ids
+    float const* minPs{nullptr};        // [BS, BM]         %% self.min_ps
 
     // Pointers for output
     int* outputIds{nullptr};            // [BS, BM, MSL]    %% self.output_ids                      only used in gather_tree
