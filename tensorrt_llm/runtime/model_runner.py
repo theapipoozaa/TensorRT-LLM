@@ -24,17 +24,17 @@ import tensorrt as trt
 import torch
 
 from .. import profiler
-from .._utils import mpi_comm, mpi_world_size
-from ..bindings import GptSession
+from .._utils import mpi_comm, mpi_world_size, numpy_to_torch, trt_gte_10
+from ..bindings import MpiComm
+from ..bindings.executor import Executor
 from ..builder import Engine, get_engine_version
 from ..logger import logger
 from ..mapping import Mapping
 from ..quantization import QuantMode
 from .generation import (ChatGLMGenerationSession, GenerationSession,
-                         LogitsProcessor, LoraManager,
-                         MambaLMHeadModelGenerationSession, ModelConfig,
+                         LogitsProcessor, LoraManager, ModelConfig,
                          QWenForCausalLMGenerationSession, SamplingConfig,
-                         StoppingCriteria)
+                         StoppingCriteria, to_word_list_format)
 
 
 def get_engine_name(model: str, dtype: str, tp_size: int, pp_size: int,
@@ -138,8 +138,6 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
     tokens_per_block = plugin_config['tokens_per_block']
     use_custom_all_reduce = plugin_config.get('use_custom_all_reduce', False)
     lora_plugin = plugin_config.get('lora_plugin')
-    use_context_fmha_for_generation = plugin_config.get(
-        'use_context_fmha_for_generation')
 
     model_config = ModelConfig(
         max_batch_size=max_batch_size,
@@ -168,7 +166,6 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
         use_custom_all_reduce=use_custom_all_reduce,
         lora_plugin=lora_plugin,
         lora_target_modules=lora_target_modules,
-        use_context_fmha_for_generation=use_context_fmha_for_generation,
         trtllm_modules_to_hf_modules=lora_trtllm_modules_to_hf_modules,
         num_medusa_heads=num_medusa_heads,
         max_medusa_tokens=max_medusa_token_len,
@@ -256,7 +253,7 @@ class ModelRunnerMixin:
 
                 context_logits_output = []
                 if self.remove_input_padding:
-                    if isinstance(self.session, GptSession) and batch_size > 1:
+                    if isinstance(self.session, Executor) and batch_size > 1:
                         # The starting position of the context logits buffer of each micro batch is separated
                         num_batches = self.mapping.pp_size
                         micro_batch_size = math.ceil(batch_size /
@@ -334,20 +331,25 @@ class ModelRunnerMixin:
 
         return outputs
 
+    def _prepare_embedding_table(self, prompt_table: Union[str, torch.Tensor]):
+        if isinstance(prompt_table, str):
+            prompt_table_data = numpy_to_torch(
+                np.load(prompt_table)).to(dtype=self.dtype)
+        else:
+            assert isinstance(
+                prompt_table,
+                torch.Tensor), "Prompt table should be str or torch.Tensor"
+            prompt_table_data = prompt_table.to(dtype=self.dtype)
+
+        return prompt_table_data
+
     def _prepare_ptuning(self, prompt_table: Union[str, torch.Tensor],
                          tasks: str, batch_size: int):
         if self.max_prompt_embedding_table_size == 0:
             return {}
 
         if prompt_table is not None:
-            if isinstance(prompt_table, str):
-                prompt_table_data = torch.from_numpy(
-                    np.load(prompt_table)).to(dtype=self.dtype)
-            else:
-                assert isinstance(
-                    prompt_table,
-                    torch.Tensor), "Prompt table should be str or torch.Tensor"
-                prompt_table_data = prompt_table.to(dtype=self.dtype)
+            prompt_table_data = self._prepare_embedding_table(prompt_table)
             _, task_vocab_size, hidden_size = prompt_table_data.size()
             task_vocab_size = torch.tensor([task_vocab_size], dtype=torch.int32)
             prompt_table_data = prompt_table_data.view(-1, hidden_size)
@@ -423,7 +425,8 @@ class ModelRunner(ModelRunnerMixin):
                     debug_mode: bool = False,
                     lora_ckpt_source: str = "hf",
                     medusa_choices: List[List[int]] = None,
-                    stream: torch.cuda.Stream = None) -> 'ModelRunner':
+                    stream: torch.cuda.Stream = None,
+                    gpu_weights_percent: float = 1) -> 'ModelRunner':
         pretrained_config = engine.config.pretrained_config
         build_config = engine.config.build_config
 
@@ -434,12 +437,14 @@ class ModelRunner(ModelRunnerMixin):
         hidden_size = pretrained_config.hidden_size // tp_size
         head_size = pretrained_config.head_size
 
-        if pretrained_config.architecture == 'MambaLMHeadModel':
-            mamba_d_state = pretrained_config.ssm_cfg['d_state']
-            mamba_expand = pretrained_config.ssm_cfg['expand']
-            mamba_d_conv = pretrained_config.ssm_cfg['d_conv']
-        else:
-            mamba_d_state, mamba_expand, mamba_d_conv = 0, 0, 0
+        rnn_config_items = [
+            'conv_kernel', 'layer_types', 'rnn_hidden_size', 'state_size',
+            'state_dtype'
+        ]
+        rnn_configs_kwargs = {}
+        for item in rnn_config_items:
+            if hasattr(pretrained_config, item):
+                rnn_configs_kwargs[item] = getattr(pretrained_config, item)
 
         model_config = ModelConfig(
             max_batch_size=build_config.max_batch_size,
@@ -465,9 +470,6 @@ class ModelRunner(ModelRunnerMixin):
             dtype=pretrained_config.dtype,
             max_prompt_embedding_table_size=build_config.
             max_prompt_embedding_table_size,
-            mamba_d_state=mamba_d_state,
-            mamba_expand=mamba_expand,
-            mamba_d_conv=mamba_d_conv,
             lora_plugin=build_config.plugin_config.lora_plugin,
             lora_target_modules=build_config.lora_config.lora_target_modules,
             trtllm_modules_to_hf_modules=build_config.lora_config.
@@ -478,6 +480,10 @@ class ModelRunner(ModelRunnerMixin):
                 pretrained_config, 'num_medusa_heads') else 0,
             use_custom_all_reduce=build_config.plugin_config.
             use_custom_all_reduce,
+            moe_tp_mode=pretrained_config.moe_tp_mode if hasattr(
+                pretrained_config, 'moe_tp_mode') else 0,
+            **rnn_configs_kwargs,
+            gpu_weights_percent=gpu_weights_percent,
         )
         max_batch_size = build_config.max_batch_size
         max_input_len = build_config.max_input_len
@@ -487,8 +493,6 @@ class ModelRunner(ModelRunnerMixin):
                 'glm', 'chatglm'
         ]:
             session_cls = ChatGLMGenerationSession
-        elif pretrained_config.architecture == 'MambaLMHeadModel':
-            session_cls = MambaLMHeadModelGenerationSession
         else:
             session_cls = GenerationSession
         engine_buffer = engine.engine
@@ -500,12 +504,16 @@ class ModelRunner(ModelRunnerMixin):
             assert model_config.max_medusa_tokens > 0, \
                 "medusa_chioce is specified but model_config.max_medusa_tokens is 0."
 
+        if MpiComm.size() > runtime_mapping.gpus_per_node:
+            assert MpiComm.local_size() == runtime_mapping.gpus_per_node
         torch.cuda.set_device(rank % runtime_mapping.gpus_per_node)
         session = session_cls(model_config,
                               engine_buffer,
                               runtime_mapping,
                               debug_mode=debug_mode,
                               stream=stream)
+        if trt_gte_10() and session.runtime.engine.streamable_weights_size:
+            session.runtime._set_weight_streaming(gpu_weights_percent)
 
         if session.use_lora_plugin:
             lora_manager = LoraManager()
@@ -532,7 +540,8 @@ class ModelRunner(ModelRunnerMixin):
                  debug_mode: bool = False,
                  lora_ckpt_source: str = "hf",
                  medusa_choices: List[List[int]] = None,
-                 stream: torch.cuda.Stream = None) -> 'ModelRunner':
+                 stream: torch.cuda.Stream = None,
+                 gpu_weights_percent: float = 1) -> 'ModelRunner':
         """
         Create a ModelRunner instance from an engine directory.
 
@@ -587,10 +596,8 @@ class ModelRunner(ModelRunnerMixin):
                 session_cls = GenerationSession
 
             if medusa_choices is not None:
-                assert session_cls == GenerationSession, "Medusa is only supported by GenerationSession"
-
                 assert model_config.max_medusa_tokens > 0, \
-                    "medusa_chioce is specified but model_config.max_medusa_tokens is 0."
+                    "medusa_choice is specified but model_config.max_medusa_tokens is 0."
 
             torch.cuda.set_device(rank % runtime_mapping.gpus_per_node)
             session = session_cls(model_config,
@@ -607,6 +614,9 @@ class ModelRunner(ModelRunnerMixin):
                                                 ckpt_source=lora_ckpt_source)
             else:
                 lora_manager = None
+
+            if trt_gte_10() and session.runtime.engine.streamable_weights_size:
+                session.runtime._set_weight_streaming(gpu_weights_percent)
 
             profiler.stop('load tensorrt_llm engine')
             loading_time = profiler.elapsed_time_in_sec(
@@ -631,7 +641,7 @@ class ModelRunner(ModelRunnerMixin):
                     lora_ckpt_source = engine.config.build_config.lora_config.lora_ckpt_source
             runner = ModelRunner.from_engine(engine, lora_dir, rank, debug_mode,
                                              lora_ckpt_source, medusa_choices,
-                                             stream)
+                                             stream, gpu_weights_percent)
             profiler.stop('load tensorrt_llm engine')
             loading_time = profiler.elapsed_time_in_sec(
                 "load tensorrt_llm engine")
@@ -744,11 +754,29 @@ class ModelRunner(ModelRunnerMixin):
         else:
             sampling_config = copy.deepcopy(sampling_config)
         sampling_config.update(**kwargs)
+
+        # To prevent numerical overflow when the temperature is set to 0.0
+        # Modify generation.SamplingConfig
+        if isinstance(sampling_config.temperature,
+                      float) and sampling_config.temperature == 0.0:
+            logger.warning(
+                "Convert `temperature=0.0` to `temperature=1.0` and `top_k=1` to prevent overflow."
+            )
+            sampling_config.temperature = 1.0
+            sampling_config.top_k = 1
+
         self._check_inputs(batch_input_ids, sampling_config)
 
         batch_size = len(batch_input_ids)
         batch_input_ids, input_lengths = self._prepare_inputs(
             batch_input_ids, sampling_config.pad_id)
+
+        if sampling_config.bad_words_list is not None:
+            sampling_config.bad_words_list = to_word_list_format(
+                sampling_config.bad_words_list)
+        if sampling_config.stop_words_list is not None:
+            sampling_config.stop_words_list = to_word_list_format(
+                sampling_config.stop_words_list)
 
         self.session.setup(
             batch_size=batch_size,

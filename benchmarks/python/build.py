@@ -40,6 +40,8 @@ from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.quantization.quantize import quantize
 
+WEIGHT_STREAMING_DISABLED_VAL = "1.0"
+
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description='Build TensorRT-LLM models.')
@@ -78,6 +80,18 @@ def parse_arguments():
             'int4_weight_only_awq', 'int4_weight_only_gptq'
         ],
         help="Optimize the model with specified quantization recipe")
+
+    parser.add_argument(
+        '--input_timing_cache',
+        type=str,
+        default=None,
+        help=
+        'The path to read timing cache, will be ignored if the file does not exist'
+    )
+    parser.add_argument('--output_timing_cache',
+                        type=str,
+                        default='model.cache',
+                        help='The path to write timing cache')
 
     parser.add_argument(
         '--profiling_verbosity',
@@ -137,10 +151,21 @@ def parse_arguments():
                         default=False,
                         action='store_true',
                         help="Build engines serially")
-    parser.add_argument('--strongly_typed',
-                        default=False,
-                        action='store_true',
-                        help='This option will reduce the building time.')
+    parser.add_argument(
+        '--multiple_profiles',
+        default=False,
+        action='store_true',
+        help=
+        'This option will benefit performance, but will increase the engine build time.'
+    )
+
+    parser.add_argument(
+        '--weight_streaming',
+        default=False,
+        action='store_true',
+        help=
+        'Specify whether offloading weights to CPU and streaming loading at runtime.',
+    )
 
     parser.add_argument(
         '--rank',
@@ -155,6 +180,24 @@ def parse_arguments():
         default=None,
         help=
         "The number of gpus to be used for inference, only used when --serial_build is specified"
+    )
+    parser.add_argument(
+        '--opt_batch_size',
+        type=int,
+        default=None,
+        help=
+        "If opt_batch_size option is specified, it will override the opt batch size."
+        "This flag only takes effect when `--mode=ootb` is added. For other modes, please use --opt_num_tokens to replace it."
+    )
+
+    parser.add_argument(
+        '--opt_num_tokens',
+        type=int,
+        default=None,
+        help="It equals to max_batch_size*max_beam_width by default, set this "
+        "value as close as possible to the actual number of tokens on your workload. "
+        "Note that this argument might be removed in the future."
+        "This flag only takes effect when `--mode` is not `ootb`. For ootb mode, please use --opt_batch_size to replace it."
     )
 
     return parser.parse_args()
@@ -173,6 +216,8 @@ def get_quant_config(quantization: str):
     elif quantization == "int8_sq_per_token_channel":
         return QuantConfig(
             quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN)
+    elif quantization == "int8_sq_per_channel_ootb":
+        return QuantConfig(quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL)
     elif quantization == "int8_weight_only":
         return QuantConfig(quant_algo=QuantAlgo.W8A16)
     elif quantization == "int4_weight_only":
@@ -202,9 +247,6 @@ def build_gpt(args):
     if not args.serial_build:
         torch.cuda.set_device(runtime_rank)
 
-    strongly_typed = args.strongly_typed
-    if args.quantization is not None and "fp8" in args.quantization:
-        strongly_typed = True
     num_kv_heads = build_config['num_heads'] \
         if build_config['num_kv_heads'] is None else build_config['num_kv_heads']
     apply_query_key_layer_scaling = False
@@ -217,26 +259,41 @@ def build_gpt(args):
     max_beam_width = build_config['max_beam_width'] \
         if args.max_beam_width is None else args.max_beam_width
 
+    opt_batch_size = build_config[
+        'opt_batch_size'] if args.opt_batch_size is None else args.opt_batch_size
+
+    opt_num_tokens = build_config[
+        'opt_num_tokens'] if args.opt_num_tokens is None else args.opt_num_tokens
+
+    if args.mode != "ootb" and opt_batch_size is not None:
+        raise Exception(
+            f'--opt_batch_size only used when mode is ootb. Please using --opt_num_tokens instead it.'
+        )
+    if args.mode == "ootb" and opt_num_tokens is not None:
+        raise Exception(
+            f'--opt_num_tokens does not support ootb mode. Please using --opt_batch_size instead it.'
+        )
+    max_num_tokens = max_batch_size * max(max_input_len, max_beam_width)
     quant_config = get_quant_config(args.quantization)
     quant_algo = quant_config.quant_algo
     kv_cache_quant_algo = quant_config.kv_cache_quant_algo
     quant_mode = quant_config.quant_mode
 
+    is_weight_streaming = getattr(args, "weight_streaming", False)
+
     builder = Builder()
     builder_config_extra_kwargs = {}
-    if get_model_family(args.model) == 'mamba':
-        builder_config_extra_kwargs['mamba_d_state'] = build_config[
-            'mamba_d_state']
-        builder_config_extra_kwargs['mamba_d_conv'] = build_config[
-            'mamba_d_conv']
-        builder_config_extra_kwargs['mamba_expand'] = build_config[
-            'mamba_expand']
-        builder_config_extra_kwargs['max_beam_width'] = max_beam_width
-        builder_config_extra_kwargs['layer_types'] = ['recurrent']
+    extra_items = [
+        'layer_types', 'conv_kernel', 'rnn_hidden_size', 'logits_soft_cap',
+        'state_size', 'use_bias'
+    ]
+    for item in extra_items:
+        if item in build_config:
+            builder_config_extra_kwargs[item] = build_config[item]
     builder_config = builder.create_builder_config(
         name=args.model,
         precision=args.dtype,
-        timing_cache=None,
+        timing_cache=args.input_timing_cache,
         profiling_verbosity=args.profiling_verbosity,
         tensor_parallel=world_size,  # TP only
         parallel_build=True,
@@ -249,14 +306,17 @@ def build_gpt(args):
         max_position_embeddings=build_config['n_positions'],
         apply_query_key_layer_scaling=apply_query_key_layer_scaling,
         max_batch_size=max_batch_size,
+        max_beam_width=max_beam_width,
         max_input_len=max_input_len,
         max_output_len=max_output_len,
+        max_num_tokens=max_num_tokens,
         int8=(quant_mode.has_act_and_weight_quant()
               or quant_mode.is_int8_weight_only()),
         quant_mode=quant_mode,
         use_refit=False,
         opt_level=build_config['builder_opt'],
-        strongly_typed=strongly_typed,
+        strongly_typed=True,
+        weight_streaming=is_weight_streaming,
         **builder_config_extra_kwargs)
     engine_name = get_engine_name(args.model, args.dtype, world_size,
                                   runtime_rank)
@@ -297,8 +357,10 @@ def build_gpt(args):
             'apply_query_key_layer_scaling':
             builder_config.apply_query_key_layer_scaling,
             'rotary_pct': build_config['rotary_pct'],
-            'moe_num_experts': build_config["moe_num_experts"],
-            'moe_top_k': build_config["moe_top_k"],
+            'moe': {
+                'num_experts': build_config["moe_num_experts"],
+                'top_k': build_config["moe_top_k"],
+            },
         }
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.GPTForCausalLM(config)
@@ -333,7 +395,7 @@ def build_gpt(args):
     elif family == "llama":
         config = {
             'architecture':
-            'LLaMAForCausalLM',
+            'LlamaForCausalLM',
             'dtype':
             args.dtype,
             'num_hidden_layers':
@@ -364,10 +426,10 @@ def build_gpt(args):
                 'world_size': world_size,
                 'tp_size': world_size
             },
-            'moe_num_experts':
-            build_config["moe_num_experts"],
-            'moe_top_k':
-            build_config["moe_top_k"],
+            'moe': {
+                'num_experts': build_config["moe_num_experts"],
+                'top_k': build_config["moe_top_k"],
+            }
         }
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.LLaMAForCausalLM(config)
@@ -511,6 +573,39 @@ def build_gpt(args):
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.ChatGLMForCausalLM(config)
 
+    elif family == "glm":
+        config = {
+            'architecture': 'ChatGLMForCausalLM',
+            'dtype': args.dtype,
+            'num_hidden_layers': build_config['num_layers'],
+            'num_attention_heads': build_config['num_heads'],
+            'num_key_value_heads': build_config['num_kv_heads'],
+            'hidden_size': build_config['hidden_size'],
+            'intermediate_size': build_config['inter_size'],
+            'norm_epsilon': 1e-5,
+            'vocab_size': build_config['vocab_size'],
+            'position_embedding_type': 'learned_absolute',
+            'max_position_embeddings': build_config['n_positions'],
+            'hidden_act': build_config['hidden_act'],
+            'quantization': {
+                'quant_algo': quant_algo,
+                'kv_cache_quant_algo': kv_cache_quant_algo
+            },
+            'mapping': {
+                'world_size': world_size,
+                'tp_size': world_size
+            },
+            'chatglm_version': 'glm',
+            'add_bias_linear': True,
+            'add_qkv_bias': True,
+            'apply_query_key_layer_scaling': False,
+            'apply_residual_connection_post_layernorm': False,
+            'rmsnorm': False,
+            'rope_ratio': 1.0,
+        }
+        config = PretrainedConfig.from_dict(config)
+        tensorrt_llm_model = tensorrt_llm.models.ChatGLMForCausalLM(config)
+
     elif family == "bloom":
         config = {
             'architecture': 'BloomForCausalLM',
@@ -536,9 +631,6 @@ def build_gpt(args):
         }
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.BloomForCausalLM(config)
-        tensorrt_llm_model = optimize_model(
-            tensorrt_llm_model,
-            use_parallel_embedding=config.use_parallel_embedding)
     elif family == "falcon":
         config = {
             'architecture':
@@ -630,7 +722,7 @@ def build_gpt(args):
     elif family == "internlm":
         config = {
             'architecture':
-            'LLaMAForCausalLM',
+            'LlamaForCausalLM',
             'dtype':
             args.dtype,
             'num_hidden_layers':
@@ -712,10 +804,10 @@ def build_gpt(args):
                 'world_size': world_size,
                 'tp_size': world_size
             },
-            'moe_num_experts':
-            build_config["moe_num_experts"],
-            'moe_top_k':
-            build_config["moe_top_k"],
+            'moe': {
+                'num_experts': build_config["moe_num_experts"],
+                'top_k': build_config["moe_top_k"],
+            },
             'qwen_type':
             'qwen',
         }
@@ -755,10 +847,10 @@ def build_gpt(args):
                 'world_size': world_size,
                 'tp_size': world_size
             },
-            'moe_num_experts':
-            build_config["moe_num_experts"],
-            'moe_top_k':
-            build_config["moe_top_k"],
+            'moe': {
+                'num_experts': build_config["moe_num_experts"],
+                'top_k': build_config["moe_top_k"],
+            },
             'qwen_type':
             'qwen2',
         }
@@ -766,24 +858,61 @@ def build_gpt(args):
         tensorrt_llm_model = tensorrt_llm.models.QWenForCausalLM(config)
     elif family == "mamba":
         config = {
-            'architecture': 'MambaLMHeadModel',
+            'architecture': 'MambaForCausalLM',
             'dtype': args.dtype,
             'vocab_size': build_config['vocab_size'],
             'hidden_size': build_config['hidden_size'],
             'num_hidden_layers': build_config['num_layers'],
             'num_attention_heads': build_config['num_heads'],
             'hidden_act': build_config['hidden_act'],
-            'ssm_cfg': {
-                'd_state': build_config['mamba_d_state'],
-                'd_conv': build_config['mamba_d_conv'],
-                'expand': build_config['mamba_expand']
-            },
+            'state_size': build_config['state_size'],
+            'conv_kernel': build_config['conv_kernel'],
+            'rnn_hidden_size': build_config['rnn_hidden_size'],
             'rms_norm': True,
             'residual_in_fp32': True,
             'pad_vocab_size_multiple': 8,
+            'use_bias': build_config['use_bias'],
         }
         config = PretrainedConfig.from_dict(config)
-        tensorrt_llm_model = tensorrt_llm.models.MambaLMHeadModel(config)
+        tensorrt_llm_model = tensorrt_llm.models.MambaForCausalLM(config)
+    elif family == "recurrentgemma":
+        config = {
+            'architecture': 'RecurrentGemmaForCausalLM',
+            'dtype': args.dtype,
+            'vocab_size': build_config['vocab_size'],
+            'hidden_size': build_config['hidden_size'],
+            'num_hidden_layers': build_config['num_layers'],
+            'num_attention_heads': build_config['num_heads'],
+            'num_key_value_heads': build_config['num_kv_heads'],
+            'hidden_act': build_config['hidden_act'],
+            'intermediate_size': build_config['inter_size'],
+            'rms_norm': True,
+            'norm_epsilon': 1e-6,
+            'quantization': {
+                'group_size': 128,
+                'quant_algo': quant_algo,
+                'kv_cache_quant_algo': kv_cache_quant_algo
+            },
+            'mapping': {
+                'world_size': world_size,
+                'tp_size': world_size
+            },
+            'position_embedding_type': build_config['position_embedding_type'],
+            'rotary_percentage': build_config['rotary_pct'],
+            'max_position_embeddings': build_config['n_positions'],
+            'conv_kernel': build_config['conv_kernel'],
+            'state_size': build_config['state_size'],
+            'layer_types': build_config['layer_types'],
+            'rnn_hidden_size': build_config['rnn_hidden_size'],
+            'logits_soft_cap': build_config['logits_soft_cap'],
+            'rotary_pct': build_config['rotary_pct'],
+        }
+        config = PretrainedConfig.from_dict(config)
+        tensorrt_llm_model = tensorrt_llm.models.RecurrentGemmaForCausalLM(
+            config)
+        tensorrt_llm_model = optimize_model(tensorrt_llm_model,
+                                            use_fused_mlp=True,
+                                            use_fused_rg_lru=True)
 
     else:
         raise Exception(f'Unexpected model: {args.model}')
@@ -795,15 +924,15 @@ def build_gpt(args):
 
     # Plugins
     if args.mode in ['plugin', 'plugin-ifb']:
-        network.plugin_config.set_gpt_attention_plugin(dtype=args.dtype)
+        network.plugin_config.gpt_attention_plugin = args.dtype
         network.plugin_config.set_context_fmha(ContextFMHAType.enabled)
-        network.plugin_config.enable_remove_input_padding()
-        network.plugin_config.set_lookup_plugin(dtype=args.dtype)
-        network.plugin_config.set_moe_plugin(dtype=args.dtype)
-        network.plugin_config.set_mamba_conv1d_plugin(dtype=args.dtype)
+        network.plugin_config.remove_input_padding = True
+        network.plugin_config.lookup_plugin = args.dtype
+        network.plugin_config.moe_plugin = args.dtype
+        network.plugin_config.mamba_conv1d_plugin = args.dtype
 
         if args.quantization is None or "fp8" not in args.quantization:
-            network.plugin_config.set_gemm_plugin(dtype=args.dtype)
+            network.plugin_config.gemm_plugin = args.dtype
 
         # Quantization plugins.
         use_smooth_quant = quant_mode.has_act_and_weight_quant()
@@ -811,36 +940,47 @@ def build_gpt(args):
         if use_smooth_quant:
             network.plugin_config.set_smooth_quant_plugins(dtype=args.dtype)
         elif use_weight_only:
-            network.plugin_config.set_weight_only_quant_matmul_plugin(
-                dtype=args.dtype)
+            network.plugin_config.weight_only_quant_matmul_plugin = args.dtype
         elif family == "llama" and quant_mode.has_act_and_weight_quant():
             # RMS norm plugin for SmoothQuant
-            network.plugin_config.set_rmsnorm_quantization_plugin(
-                dtype=args.dtype)
+            network.plugin_config.rmsnorm_quantization_plugin = args.dtype
 
         # Inflight batching
         if args.mode == 'plugin-ifb':
             network.plugin_config.enable_paged_kv_cache()
+            network.plugin_config.paged_state = True
     elif args.mode == 'ootb-except-mha':
-        network.plugin_config.set_gpt_attention_plugin(dtype=args.dtype)
+        network.plugin_config.gpt_attention_plugin = args.dtype
         network.plugin_config.set_context_fmha(ContextFMHAType.enabled)
+        network.plugin_config.remove_input_padding = True
 
     if world_size > 1:
         network.plugin_config.set_nccl_plugin(
             dtype=args.dtype,
             use_custom_all_reduce=build_config["use_custom_all_reduce"])
 
+    if args.multiple_profiles:
+        network.plugin_config.multiple_profiles = True
+
     with net_guard(network):
         # Prepare
         network.set_named_parameters(tensorrt_llm_model.named_parameters())
 
         # Forward
+        print(
+            f"max_batch_size: {max_batch_size}, max_input_len: {max_input_len}, max_output_len: {max_output_len}, max_beam_width: {max_beam_width}"
+        )
+        # NOTE: all other models use PretrainedModel.prepare_inputs(...)
+        # except RecurrentGemmaForCausalLM and MambaForCausalLM
         inputs = tensorrt_llm_model.prepare_inputs(
             max_batch_size=max_batch_size,
             max_input_len=max_input_len,
             max_seq_len=max_input_len + max_output_len,
+            max_num_tokens=max_num_tokens,
             use_cache=True,
-            max_beam_width=max_beam_width)
+            max_beam_width=max_beam_width,
+            opt_batch_size=opt_batch_size,
+            opt_num_tokens=opt_num_tokens)
 
         tensorrt_llm_model(**inputs)
 
@@ -861,6 +1001,16 @@ def build_gpt(args):
             config_path = os.path.join(args.output_dir, 'config.json')
             builder_config.plugin_config = network.plugin_config
             builder.save_config(builder_config, config_path)
+            if args.output_timing_cache:
+                # Save timing cache to output_dir if not absolute path
+                timing_cache_path = args.output_timing_cache if os.path.isabs(
+                    args.output_timing_cache) else os.path.join(
+                        args.output_dir, args.output_timing_cache)
+                ok = builder.save_timing_cache(builder_config,
+                                               timing_cache_path)
+                if not ok:
+                    logger.warning("Failed to save timing cache.")
+
     return engine, build_time
 
 
@@ -889,11 +1039,13 @@ def build_bert(args):
     bs_range = [1, (max_batch_size + 1) // 2, max_batch_size]
     inlen_range = [1, (max_input_len + 1) // 2, max_input_len]
 
+    is_weight_streaming = getattr(args, "weight_streaming", False)
+
     builder = Builder()
     builder_config = builder.create_builder_config(
         name=args.model,
         precision=args.dtype,
-        timing_cache=None,
+        timing_cache=args.input_timing_cache,
         profiling_verbosity=args.profiling_verbosity,
         tensor_parallel=world_size,  # TP only
         parallel_build=True,
@@ -907,7 +1059,9 @@ def build_bert(args):
         max_batch_size=max_batch_size,
         max_input_len=max_input_len,
         opt_level=build_config['builder_opt'],
-        strongly_typed=args.strongly_typed)
+        strongly_typed=True,
+        weight_streaming=is_weight_streaming,
+    )
     engine_name = get_engine_name(args.model, args.dtype, world_size,
                                   runtime_rank)
 
@@ -933,12 +1087,12 @@ def build_bert(args):
 
     # Plugins
     if args.mode == 'plugin':
-        network.plugin_config.set_bert_attention_plugin(dtype=args.dtype)
-        network.plugin_config.set_gemm_plugin(dtype=args.dtype)
-        network.plugin_config.enable_qk_half_accum()
+        network.plugin_config.bert_attention_plugin = args.dtype
+        network.plugin_config.gemm_plugin = args.dtype
+        network.plugin_config.attention_qk_half_accumulation = True
         network.plugin_config.set_context_fmha(ContextFMHAType.enabled)
     elif args.mode == 'ootb-except-mha':
-        network.plugin_config.set_bert_attention_plugin(dtype=args.dtype)
+        network.plugin_config.bert_attention_plugin = args.dtype
         network.plugin_config.set_context_fmha(ContextFMHAType.enabled)
 
     if world_size > 1:
@@ -986,6 +1140,16 @@ def build_bert(args):
             config_path = os.path.join(args.output_dir, 'config.json')
             builder_config.plugin_config = network.plugin_config
             builder.save_config(builder_config, config_path)
+            if args.output_timing_cache:
+                # Save timing cache to output_dir if not absolute path
+                timing_cache_path = args.output_timing_cache if os.path.isabs(
+                    args.output_timing_cache) else os.path.join(
+                        args.output_dir, args.output_timing_cache)
+                ok = builder.save_timing_cache(builder_config,
+                                               timing_cache_path)
+                if not ok:
+                    logger.warning("Failed to save timing cache.")
+
     return engine, build_time
 
 
@@ -1046,13 +1210,14 @@ def enc_dec_build_helper(component, config, args):
     quant_config = get_quant_config(args.quantization)
     quant_mode = quant_config.quant_mode
     use_weight_only = quant_mode.is_weight_only()
+    is_weight_streaming = getattr(args, "weight_streaming", False)
 
     builder = Builder()
     builder_config = builder.create_builder_config(
         name=args.model,
         precision=args.dtype,
-        timing_cache=None,
-        profiling_verbosity='layer_names_only',  # by default
+        timing_cache=args.input_timing_cache,
+        profiling_verbosity=args.profiling_verbosity,
         tensor_parallel=world_size,  # TP only
         parallel_build=True,
         num_layers=config['num_layers'],
@@ -1072,13 +1237,14 @@ def enc_dec_build_helper(component, config, args):
         cross_attention=(component == 'decoder'),
         has_position_embedding=has_position_embedding,
         has_token_type_embedding=False,  # by default
-        strongly_typed=False,  # by default
+        strongly_typed=True,
         gather_all_token_logits=False,  # by default
         int8=(quant_mode.has_act_and_weight_quant()
               or quant_mode.is_int8_weight_only()),
         quant_mode=quant_mode,
         n_mels=n_mels,
         skip_cross_qkv=config['skip_cross_qkv'],
+        weight_streaming=is_weight_streaming,
     )
 
     # build engine
@@ -1091,13 +1257,29 @@ def enc_dec_build_helper(component, config, args):
 
     if component == 'encoder':
         if family == 'whisper':
-            tllm_model = tensorrt_llm.models.WhisperEncoder(
-                n_mels=config['n_mels'],
-                n_ctx=1500,  # n_audio_ctx
-                n_state=config['hidden_size'],
-                n_head=config['num_heads'],
-                n_layer=config['num_layers'],
-                dtype=dtype)
+            pretrained_config = PretrainedConfig.from_dict({
+                'architecture':
+                "WhisperEncoder",
+                'dtype':
+                dtype,
+                'num_hidden_layers':
+                config['num_layers'],
+                'num_attention_heads':
+                config['num_heads'],
+                'hidden_size':
+                config['hidden_size'],
+                'n_mels':
+                config['n_mels'],
+                'n_audio_ctx':
+                1500,
+                'vocab_size':
+                config['vocab_size'],
+                'hidden_act':
+                "gelu",
+                'num_languages':
+                100,
+            })
+            tllm_model = tensorrt_llm.models.WhisperEncoder(pretrained_config)
             if use_weight_only:
                 tllm_model = quantize(tllm_model, quant_config)
         else:
@@ -1149,7 +1331,7 @@ def enc_dec_build_helper(component, config, args):
                 has_embedding_layernorm,
                 'has_embedding_scale':
                 config.get('has_embedding_scale', False),
-                'ffn_hidden_size':
+                'intermediate_size':
                 config['ffn_hidden_size'],
                 'q_scaling':
                 q_scaling,
@@ -1214,7 +1396,7 @@ def enc_dec_build_helper(component, config, args):
             has_embedding_layernorm,
             'has_embedding_scale':
             config.get('has_embedding_scale', False),
-            'ffn_hidden_size':
+            'intermediate_size':
             config['ffn_hidden_size'],
             'q_scaling':
             q_scaling,
@@ -1237,11 +1419,15 @@ def enc_dec_build_helper(component, config, args):
             'encoder_head_size':
             config['head_size'],
             'skip_cross_qkv':
-            config['skip_cross_qkv']
+            config['skip_cross_qkv'],
+            'use_implicit_relative_attention':
+            config['use_implicit_relative_attention']
         })
         tllm_model = tensorrt_llm.models.DecoderModel(pretrained_config)
         if use_weight_only and family == 'whisper':
             tllm_model = quantize(tllm_model, quant_config)
+
+    tllm_model.precompute_relative_attention_bias(builder_config)
 
     # Module -> Network
     engine_name = get_engine_name(args.model, args.dtype, world_size,
@@ -1252,15 +1438,14 @@ def enc_dec_build_helper(component, config, args):
 
     # Plugins
     if args.mode == 'plugin':
-        network.plugin_config.set_bert_attention_plugin(dtype=args.dtype)
-        network.plugin_config.set_gemm_plugin(dtype=args.dtype)
-        network.plugin_config.set_gpt_attention_plugin(dtype=args.dtype)
+        network.plugin_config.bert_attention_plugin = args.dtype
+        network.plugin_config.gemm_plugin = args.dtype
+        network.plugin_config.gpt_attention_plugin = args.dtype
         if use_weight_only:
-            network.plugin_config.set_weight_only_quant_matmul_plugin(
-                dtype=args.dtype)
+            network.plugin_config.weight_only_quant_matmul_plugin = args.dtype
     elif args.mode == 'ootb-except-mha':
-        network.plugin_config.set_bert_attention_plugin(dtype=args.dtype)
-        network.plugin_config.set_gpt_attention_plugin(dtype=args.dtype)
+        network.plugin_config.bert_attention_plugin = args.dtype
+        network.plugin_config.gpt_attention_plugin = args.dtype
 
     if world_size > 1:
         network.plugin_config.set_nccl_plugin(
@@ -1275,7 +1460,7 @@ def enc_dec_build_helper(component, config, args):
             if family == 'whisper':
                 inputs = tllm_model.prepare_inputs(
                     max_batch_size=config['max_batch_size'], )
-                tllm_model(*inputs)
+                tllm_model(**inputs)
             else:
                 inputs = tllm_model.prepare_inputs(
                     max_batch_size=config['max_batch_size'],
@@ -1341,7 +1526,15 @@ def enc_dec_build_helper(component, config, args):
             config_path = os.path.join(output_dir, 'config.json')
             builder_config.plugin_config = network.plugin_config
             builder.save_config(builder_config, config_path)
-
+            if args.output_timing_cache:
+                # Save timing cache to output_dir if not absolute path
+                timing_cache_path = args.output_timing_cache if os.path.isabs(
+                    args.output_timing_cache) else os.path.join(
+                        args.output_dir, args.output_timing_cache)
+                ok = builder.save_timing_cache(builder_config,
+                                               timing_cache_path)
+                if not ok:
+                    logger.warning("Failed to save timing cache.")
     return engine, model_config, build_time
 
 

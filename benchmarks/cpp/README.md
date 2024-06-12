@@ -67,7 +67,7 @@ If you want to get the logits, you could run gptSessionBenchmark with `--print_a
 
 #### Prepare dataset
 
-Run a preprocessing script to prepare/generate dataset into a json that gptManagerBenchmark can consume later. The processed output json has *input token ids, output tokens length and time delays* to control request rate by gptManagerBenchmark.
+Run a preprocessing script to prepare/generate dataset into a json that gptManagerBenchmark can consume later. The processed output json has *input tokens length, input token ids and output tokens length*
 
 This tool can be used in 2 different modes of traffic generation.
 
@@ -79,8 +79,6 @@ The tool will tokenize the words and instruct the model to generate a specified 
 python3 prepare_dataset.py \
     --tokenizer <path/to/tokenizer> \
     --output preprocessed_dataset.json
-    [--request-rate 10] \
-    [--time-delay-dist exponential_dist] \
     dataset
     --dataset-name <name of the dataset> \
     --dataset-split <split of the dataset to use> \
@@ -118,8 +116,6 @@ For example, setting mean=100 and std dev=10 would generate requests where 95.4%
 ```
 python prepare_dataset.py \
   --output token-norm-dist.json \
-  --request-rate 10 \
-  --time-delay-dist constant \
   --tokenizer <path/to/tokenizer> \
    token-norm-dist \
    --num-requests 100 \
@@ -148,6 +144,7 @@ Take GPT-350M as an example for single GPU V1 batching
 ./benchmarks/gptManagerBenchmark \
     --engine_dir ../../examples/gpt/trt_engine/gpt2/fp16/1-gpu/ \
     --type V1 \
+    --request_rate 10 \
     --dataset ../../benchmarks/cpp/preprocessed_dataset.json
     --max_num_samples 500
 ```
@@ -157,11 +154,12 @@ Take GPT-350M as an example for 2-GPU inflight batching
 mpirun -n 2 ./benchmarks/gptManagerBenchmark \
     --engine_dir ../../examples/gpt/trt_engine/gpt2-ib/fp16/2-gpu/ \
     --type IFB \
+    --request_rate 10 \
     --dataset ../../benchmarks/cpp/preprocessed_dataset.json
     --max_num_samples 500
 ```
 
-`gptManagerBenchmark` can also be used with the high-level C++ API defined by the `executor::Executor` class (see `cpp/include/tensorrt_llm/executor/executor.h`). This can be done by passing the argument `--api executor`. Note that the Executor class is still under development and currently does not support models with tp or pp > 1.
+`gptManagerBenchmark` by default uses the high-level C++ API defined by the `executor::Executor` class (see `cpp/include/tensorrt_llm/executor/executor.h`).
 
 #### Emulated static batching
 
@@ -172,8 +170,6 @@ Given a `static_emulated_batch_size` of `n` the server will wait for `n` request
 ```
  python prepare_dataset.py \
   --output tokens-fixed-lengths.json \
-  --request-rate -1 \
-  --time-delay-dist constant \
   --tokenizer <path/to/tokenizer> \
    token-norm-dist \
    --num-requests 128 \
@@ -186,6 +182,7 @@ Take GPT-350M as an example for single GPU with static batching
 ./benchmarks/gptManagerBenchmark \
     --engine_dir ../../examples/gpt/trt_engine/gpt2/fp16/1-gpu/ \
     --type IFB \
+    --request-rate -1 \
     --static_emulated_batch_size 32 \
     --static_emulated_timeout 100 \
     --dataset ../../benchmarks/cpp/tokens-fixed-lengths.json
@@ -213,7 +210,10 @@ TP=2
 PP=1
 MAX_LEN=1024
 MAX_BATCH=32
-MAX_LORA_RANK=32
+NUM_LAYERS=40
+MAX_LORA_RANK=64
+NUM_LORA_MODS=7
+EOS_ID=2
 
 SOURCE_LORA=chinese-llama-2-lora-13b
 CPP_LORA=chinese-llama-2-lora-13b-cpp
@@ -236,17 +236,16 @@ ${HOME}/.local/bin/trtllm-build \
     --gemm_plugin float16 \
     --lora_plugin float16 \
     --use_paged_context_fmha enable \
-    --lora_target_modules attn_qkv \
+    --lora_target_modules attn_q attn_k attn_v attn_dense mlp_h_to_4h mlp_4h_to_h mlp_gate \
     --max_lora_rank ${MAX_LORA_RANK}
 
 NUM_LORAS=(8 16 24 32 64 128 256)
 NUM_REQUESTS=1024
 
 # Convert LoRA to cpp format
-python examples/gpt/nemo_lora_convert.py \
+python examples/hf_lora_convert.py \
     -i $SOURCE_LORA \
     --storage-type $DTYPE \
-    --write-cpp-runtime-tensors \
     -o $CPP_LORA
 
 # Prepare datasets
@@ -255,8 +254,6 @@ mkdir -p $EG_DIR/data
 # Prepare dataset without lora_task_id
 python benchmarks/cpp/prepare_dataset.py \
     --output "${EG_DIR}/data/token-norm-dist.json" \
-    --request-rate -1 \
-    --time-delay-dist constant \
     --tokenizer $TOKENIZER \
     token-norm-dist \
     --num-requests $NUM_REQUESTS \
@@ -266,8 +263,6 @@ python benchmarks/cpp/prepare_dataset.py \
 for nloras in ${NUM_LORAS[@]}; do
     python benchmarks/cpp/prepare_dataset.py \
         --output "${EG_DIR}/data/token-norm-dist-lora-${nloras}.json" \
-        --request-rate -1 \
-        --time-delay-dist constant \
         --rand-task-id 0 $(( $nloras - 1 )) \
         --tokenizer $TOKENIZER \
         token-norm-dist \
@@ -295,7 +290,7 @@ mpirun -n ${TP} --output-filename ${EG_DIR}/log-base-lora \
 
 # Now run inference with various numbers or loras
 # The host cache is set large enough to hold all the LoRAs in lora_dir
-# GPU cache is set to hold 32 LoRAs
+# GPU cache is set to hold 16 LoRAs
 # This benchmark will preload all the LoRAs into the host cache
 # We run inference on a range of active LoRAs exercising different cache miss rates.
 for nloras in ${NUM_LORAS[@]}; do
@@ -306,7 +301,7 @@ for nloras in ${NUM_LORAS[@]}; do
         --type IFB \
         --dataset "${EG_DIR}/data/token-norm-dist-lora-${nloras}.json" \
         --lora_host_cache_bytes 8589934592 \
-        --lora_num_device_mod_layers $(( 32 * $NUM_LAYERS * $NUM_LORA_MODS * $MAX_LORA_RANK )) \
+        --lora_num_device_mod_layers $(( 16 * $NUM_LAYERS * $NUM_LORA_MODS * $MAX_LORA_RANK )) \
         --kv_cache_free_gpu_mem_fraction 0.80 \
         --log_level info \
         --eos_id ${EOS_ID} \

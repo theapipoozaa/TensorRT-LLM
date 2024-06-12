@@ -16,11 +16,11 @@
  */
 #ifndef TRT_GEMM_PLUGIN_H
 #define TRT_GEMM_PLUGIN_H
+
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
-#include <cassert>
-#include <set>
+
 #include <string>
 #include <vector>
 
@@ -79,7 +79,7 @@ public:
 
     GemmPlugin() = delete;
 
-    GemmPlugin(int transA, int transB, int padLda, int padLdb, nvinfer1::DataType type, bool useFp8,
+    GemmPlugin(int transA, int transB, int padLda, int padLdb, nvinfer1::DataType type, bool useFp8, float alpha,
         PluginProfilerPtr const& profiler);
 
     GemmPlugin(void const* data, size_t length, PluginProfilerPtr const& profiler);
@@ -135,6 +135,7 @@ private:
     GemmDims mDims{};
     GemmIdCublas mGemmId{};
     bool mUseFp8{false};
+    float mAlpha{1.f};
 
     PluginProfilerPtr mPluginProfiler;
 };

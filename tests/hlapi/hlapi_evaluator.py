@@ -8,6 +8,7 @@ import click
 
 from tensorrt_llm.hlapi import ModelConfig
 from tensorrt_llm.hlapi._perf_evaluator import LLMPerfEvaluator
+from tensorrt_llm.hlapi.llm import ModelLoader, _ModelFormatKind
 from tensorrt_llm.hlapi.utils import print_colored
 
 try:
@@ -39,6 +40,7 @@ def cli():
     default=None,
     help="Path to the cpp executable, set it if you want to run the cpp benchmark"
 )
+@click.option("--enable-executor", is_flag=True, default=False)
 def benchmark_main(model_path: str,
                    samples_path: str,
                    report_path_prefix: str,
@@ -50,7 +52,8 @@ def benchmark_main(model_path: str,
                    max_output_length: int = 200,
                    max_batch_size: int = 128,
                    engine_output_dir: str = "",
-                   cpp_executable: str = None):
+                   cpp_executable: str = None,
+                   enable_executor: bool = False):
     ''' Run the benchmark on HLAPI.
     If `cpp_executable_path` is provided, it will run the cpp benchmark as well.
     '''
@@ -66,19 +69,22 @@ def benchmark_main(model_path: str,
     if engine_output_dir:
         engine_output_dir = Path(engine_output_dir)
     elif cpp_executable:
-        temp_dir = tempfile.TemporaryDirectory()
-        engine_output_dir = Path(temp_dir.name)
+        if ModelLoader.get_model_format(
+                model_path) is _ModelFormatKind.TLLM_ENGINE:
+            engine_output_dir = model_path
+        else:
+            temp_dir = tempfile.TemporaryDirectory()
+            engine_output_dir = Path(temp_dir.name)
 
     def run_hlapi():
         print_colored(f"Running HLAPI benchmark ...\n", "bold_green")
 
         config = ModelConfig(model_path)
-        config._set_additional_options(
-            max_num_tokens=max_num_tokens,
-            max_input_len=max_input_length,
-            max_output_len=max_output_length,
-            max_batch_size=max_batch_size,
-        )
+        build_config = config.build_config
+        build_config.max_num_tokens = max_num_tokens
+        build_config.max_input_len = max_input_length
+        build_config.max_output_len = max_output_length
+        build_config.max_batch_size = max_batch_size
         config.parallel_config.tp_size = tp_size
 
         evaluator = LLMPerfEvaluator.create(
@@ -90,6 +96,8 @@ def benchmark_main(model_path: str,
             # The options should be identical to the cpp benchmark
             use_custom_all_reduce=True,
             enable_chunked_context=False,
+            # additional options to LLM
+            enable_executor=enable_executor,
         )
         assert evaluator
         report = evaluator.run()
@@ -114,6 +122,8 @@ def benchmark_main(model_path: str,
                 "../../cpp/build/benchmarks/gptManagerBenchmark")
 
         run_command = f"{cpp_executable_path} --engine_dir {engine_output_dir} --type IFB --dataset {samples_path} --warm_up {warmup} --output_csv {report_path_prefix}.cpp.csv"
+        if enable_executor:
+            run_command += " --api executor"
         launch_prefix = f"mpirun -n {tp_size}" if tp_size > 1 else ""
         command = f"{launch_prefix} {run_command}"
         output = subprocess.run(command,

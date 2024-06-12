@@ -21,11 +21,13 @@
 
 #include "tensorrt_llm/plugins/bertAttentionPlugin/bertAttentionPlugin.h"
 #include "tensorrt_llm/plugins/gemmPlugin/gemmPlugin.h"
+#include "tensorrt_llm/plugins/gemmSwigluPlugin/gemmSwigluPlugin.h"
 #include "tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.h"
 #include "tensorrt_llm/plugins/identityPlugin/identityPlugin.h"
 #include "tensorrt_llm/plugins/layernormQuantizationPlugin/layernormQuantizationPlugin.h"
 #include "tensorrt_llm/plugins/lookupPlugin/lookupPlugin.h"
 #include "tensorrt_llm/plugins/loraPlugin/loraPlugin.h"
+#include "tensorrt_llm/plugins/lruPlugin/lruPlugin.h"
 #include "tensorrt_llm/plugins/mambaConv1dPlugin/mambaConv1dPlugin.h"
 #include "tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.h"
 #if ENABLE_MULTI_DEVICE
@@ -35,6 +37,7 @@
 #include "tensorrt_llm/plugins/ncclPlugin/reduceScatterPlugin.h"
 #include "tensorrt_llm/plugins/ncclPlugin/sendPlugin.h"
 #endif // ENABLE_MULTI_DEVICE
+#include "tensorrt_llm/plugins/cumsumLastDimPlugin/cumsumLastDimPlugin.h"
 #include "tensorrt_llm/plugins/quantizePerTokenPlugin/quantizePerTokenPlugin.h"
 #include "tensorrt_llm/plugins/quantizeTensorPlugin/quantizeTensorPlugin.h"
 #include "tensorrt_llm/plugins/rmsnormQuantizationPlugin/rmsnormQuantizationPlugin.h"
@@ -171,6 +174,7 @@ extern "C"
         static tensorrt_llm::plugins::BertAttentionPluginCreator bertAttentionPluginCreator;
         static tensorrt_llm::plugins::GPTAttentionPluginCreator gptAttentionPluginCreator;
         static tensorrt_llm::plugins::GemmPluginCreator gemmPluginCreator;
+        static tensorrt_llm::plugins::GemmSwigluPluginCreator gemmSwigluPluginCreator;
         static tensorrt_llm::plugins::MixtureOfExpertsPluginCreator moePluginCreator;
 #if ENABLE_MULTI_DEVICE
         static tensorrt_llm::plugins::SendPluginCreator sendPluginCreator;
@@ -191,12 +195,15 @@ extern "C"
         static tensorrt_llm::plugins::LoraPluginCreator loraPluginCreator;
         static tensorrt_llm::plugins::SelectiveScanPluginCreator selectiveScanPluginCreator;
         static tensorrt_llm::plugins::MambaConv1dPluginCreator mambaConv1DPluginCreator;
+        static tensorrt_llm::plugins::lruPluginCreator lruPluginCreator;
+        static tensorrt_llm::plugins::CumsumLastDimPluginCreator cumsumLastDimPluginCreator;
 
         static std::array pluginCreators
             = { creatorPtr(identityPluginCreator),
                   creatorPtr(bertAttentionPluginCreator),
                   creatorPtr(gptAttentionPluginCreator),
                   creatorPtr(gemmPluginCreator),
+                  creatorPtr(gemmSwigluPluginCreator),
                   creatorPtr(moePluginCreator),
 #if ENABLE_MULTI_DEVICE
                   creatorPtr(sendPluginCreator),
@@ -216,9 +223,15 @@ extern "C"
                   creatorPtr(loraPluginCreator),
                   creatorPtr(selectiveScanPluginCreator),
                   creatorPtr(mambaConv1DPluginCreator),
+                  creatorPtr(lruPluginCreator),
+                  creatorPtr(cumsumLastDimPluginCreator),
               };
         nbCreators = pluginCreators.size();
         return pluginCreators.data();
     }
 
+    [[maybe_unused]] nvinfer1::IPluginCreatorInterface* const* getCreators(std::int32_t& nbCreators)
+    {
+        return reinterpret_cast<nvinfer1::IPluginCreatorInterface* const*>(getPluginCreators(nbCreators));
+    }
 } // extern "C"

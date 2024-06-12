@@ -17,8 +17,9 @@ from typing import Optional
 
 from ..._utils import pad_vocab_size
 from ...functional import Tensor, cast, recv, send
-from ...layers import (Attention, AttentionMaskType, ColumnLinear, Embedding,
-                       GatedMLP, PositionEmbeddingType, RmsNorm)
+from ...layers import (Attention, AttentionMaskType, AttentionParams,
+                       ColumnLinear, Embedding, GatedMLP, KeyValueCacheParams,
+                       LoraParams, PositionEmbeddingType, RmsNorm)
 from ...mapping import Mapping
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
@@ -71,28 +72,22 @@ class GemmaDecoderLayer(Module):
                                       eps=config.norm_epsilon,
                                       dtype=config.dtype)
 
-    def forward(
-            self,
-            hidden_states,
-            attention_mask=None,
-            medusa_packed_mask=None,  # For Medusa support
-            medusa_position_offsets=None,
-            use_cache=False,
-            kv_cache_params=None,
-            attention_params=None,
-            lora_layer_params=None):
+    def forward(self,
+                hidden_states: Tensor,
+                attention_mask: Optional[Tensor] = None,
+                use_cache: bool = False,
+                kv_cache_params: Optional[KeyValueCacheParams] = None,
+                attention_params: Optional[AttentionParams] = None,
+                lora_layer_params: Optional[LoraParams] = None):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        attention_output = self.attention(
-            hidden_states,
-            attention_mask=attention_mask,
-            medusa_packed_mask=medusa_packed_mask,  # For Medusa support
-            medusa_position_offsets=medusa_position_offsets,
-            use_cache=use_cache,
-            kv_cache_params=kv_cache_params,
-            attention_params=attention_params,
-            lora_layer_params=lora_layer_params)
+        attention_output = self.attention(hidden_states,
+                                          attention_mask=attention_mask,
+                                          use_cache=use_cache,
+                                          kv_cache_params=kv_cache_params,
+                                          attention_params=attention_params,
+                                          lora_layer_params=lora_layer_params)
 
         if use_cache:
             attention_output, presents = attention_output
@@ -187,15 +182,19 @@ class GemmaForCausalLM(DecoderModelForCausalLM):
                                            config.mapping.tp_size)
 
         try:
-            import ammo
-            major, minor, patch = ammo.__version__.split(".")
+            import modelopt
+            major, minor, patch = modelopt.__version__.split(".")
             major = int(major)
             minor = int(minor)
             patch = int(patch)
-            if minor > 9 or (minor == 9 and patch > 4):
-                assert config.share_embedding_table, "Gemma only supports share_embedding_table"
+            if major == 0 and minor == 11 and patch < 1:
+                # modelopt=0.11.0 won't force this field to True, this is a hot fix
+                # TODO: can remove after modelop=0.11.1 is out
+                # TRT LLM forces the embedding table to be shared for gemma.
+                config.share_embedding_table = True
+            assert config.share_embedding_table, "Gemma only supports share_embedding_table"
         except:
-            # Not find ammo, assume not use ammo quantized model
+            # Not find modelopt, assume not use modelopt quantized model
             assert config.share_embedding_table, "Gemma only supports share_embedding_table"
 
         if config.mapping.is_last_pp_rank():
@@ -252,7 +251,7 @@ class GemmaForCausalLM(DecoderModelForCausalLM):
             'rotary_base': getattr(cfg, 'rotary_base', 10000.0),
             'rotary_scaling': getattr(cfg, 'rotary_scaling', None),
             'norm_epsilon': cfg.rms_norm_eps,
-            'quantization': quantization.asdict(),
+            'quantization': quantization.to_dict(),
             'mapping': {
                 'world_size': mapping.world_size,
                 'tp_size': mapping.world_size,

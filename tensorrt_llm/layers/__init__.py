@@ -14,8 +14,9 @@
 # limitations under the License.
 from .activation import Mish
 from .attention import (Attention, AttentionMaskType, AttentionParams,
-                        BertAttention, KeyValueCacheParams,
-                        PositionEmbeddingType)
+                        BertAttention, BlockSparseAttnParams, CogVLMAttention,
+                        KeyValueCacheParams, PositionEmbeddingType,
+                        SpecDecodingParams)
 from .cast import Cast
 from .conv import Conv1d, Conv2d, ConvTranspose2d
 from .embedding import Embedding, PromptTuningEmbedding
@@ -26,7 +27,8 @@ from .mlp import MLP, FusedGatedMLP, GatedMLP
 from .moe import MOE, MoeConfig
 from .normalization import GroupNorm, LayerNorm, RmsNorm
 from .pooling import AvgPool2d
-from .ssm import Mamba, MambaParameters
+from .recurrent import FusedRgLru, GroupedLinear, Recurrent, RgLru
+from .ssm import Mamba
 
 __all__ = [
     'LayerNorm',
@@ -40,6 +42,7 @@ __all__ = [
     'PositionEmbeddingType',
     'Attention',
     'BertAttention',
+    'CogVLMAttention',
     'GroupNorm',
     'Embedding',
     'PromptTuningEmbedding',
@@ -53,12 +56,17 @@ __all__ = [
     'FusedGatedMLP',
     'Cast',
     'AttentionParams',
+    'SpecDecodingParams',
     'KeyValueCacheParams',
+    'BlockSparseAttnParams',
     'Lora',
     'LoraParams',
     'LoraRuntimeParams',
     'MOE',
     'MoeConfig',
     'Mamba',
-    'MambaParameters',
+    'Recurrent',
+    'GroupedLinear',
+    'RgLru',
+    'FusedRgLru',
 ]

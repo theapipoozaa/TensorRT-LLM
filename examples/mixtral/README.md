@@ -116,7 +116,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_mixtral_2gpu \
 
 ### FP8 Post-Training Quantization
 
-Mixtral supports FP8 quantization, using AMMO. See [`examples/llama/README.md`](../llama/README.md#fp8-post-training-quantization) for full details on installing AMMO
+Mixtral supports FP8 quantization, using Modelopt. See [`examples/llama/README.md`](../llama/README.md#fp8-post-training-quantization) for full details on installing Modelopt
 
 ```bash
 # Quantize HF Mixtral into FP8 and export trtllm checkpoint
@@ -133,7 +133,6 @@ python ../quantization/quantize.py --model_dir ./Mixtral-8x7B-v0.1 \
 trtllm-build --checkpoint_dir ./tllm_checkpoint_mixtral_2gpu \
              --output_dir ./engine_outputs \
              --gemm_plugin float16 \
-             --strongly_typed \
              --workers 2
 ```
 

@@ -24,21 +24,21 @@ from typing import Union
 
 import torch
 
-from .._common import check_max_num_tokens
 from ..auto_parallel import infer_cluster_config
 from ..auto_parallel.cluster_info import cluster_infos
 from ..builder import BuildConfig, Engine, build
 from ..logger import logger
-from ..lora_manager import LoraBuildConfig
-from ..models import PretrainedConfig
+from ..lora_manager import LoraConfig, LoraManager
+from ..models import MODEL_MAP, PretrainedConfig
 from ..models.modeling_utils import (WEIGHT_LOADER_MODELS, QuantConfig,
-                                     load_model)
+                                     SpeculativeDecodingMode)
 from ..plugin import PluginConfig, add_plugin_argument
 from ..quantization import QuantAlgo
 
 
 def parse_arguments():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--checkpoint_dir', type=str, default=None)
     parser.add_argument('--model_config', type=str, default=None)
     parser.add_argument('--build_config', type=str, default=None)
@@ -76,11 +76,11 @@ def parse_arguments():
                         type=int,
                         default='1',
                         help='The number of workers for building in parallel')
-    parser.add_argument('--max_batch_size', type=int, default=1)
+    parser.add_argument('--max_batch_size', type=int, default=256)
     parser.add_argument('--max_input_len', type=int, default=1024)
     parser.add_argument('--max_output_len', type=int, default=1024)
     parser.add_argument('--max_beam_width', type=int, default=1)
-    parser.add_argument('--max_num_tokens', type=int, default=None)
+    parser.add_argument('--max_num_tokens', type=int, default=8192)
     parser.add_argument(
         '--opt_num_tokens',
         type=int,
@@ -104,8 +104,8 @@ def parse_arguments():
         action='store_true',
         help=
         'Enable horizontal fusion in GatedMLP, reduces layer input traffic and potentially improves performance. '
-        'For FP8 PTQ, the downside is slight reduction of accuracy because one of the quantization scaling factors are discarded. '
-        '(An example for reference only: 0.45734 vs 0.45755 for LLaMA-v2 7B using `ammo/examples/hf/instruct_eval/mmlu.py`).'
+        'For FP8 PTQ, the downside is slight reduction of accuracy because one of the quantization scaling factors is discarded. '
+        '(An example for reference only: 0.45734 vs 0.45755 for LLaMA-v2 7B using `modelopt/examples/hf/instruct_eval/mmlu.py`).'
     )
     parser.add_argument(
         '--gather_all_token_logits',
@@ -120,15 +120,7 @@ def parse_arguments():
                         action='store_true',
                         default=False,
                         help='Gather generation logits')
-    parser.add_argument(
-        '--strongly_typed',
-        action='store_true',
-        default=False,
-        help=
-        'This option is introduced with TensorRT 9.1.0.1+ and will reduce the engine building time. '
-        'It\'s not expected to see performance or accuracy regression after enable this flag. '
-        'Note that, we may remove this flag in the future, and enable the feature by default.'
-    )
+
     parser.add_argument('--builder_opt', type=int, default=None)
     parser.add_argument('--logits_dtype',
                         type=str,
@@ -163,18 +155,7 @@ def parse_arguments():
         '--lora_target_modules',
         nargs='+',
         default=None,
-        choices=[
-            "attn_qkv",
-            "attn_q",
-            "attn_k",
-            "attn_v",
-            "attn_dense",
-            "mlp_h_to_4h",
-            "mlp_gate",
-            "mlp_4h_to_h",
-            "cross_attn_q",
-            "cross_attn_v",
-        ],
+        choices=LoraManager.LORA_MODULE_IDS.keys(),
         help=
         "Add lora in which modules. Only be activated when use_lora_plugin is enabled."
     )
@@ -204,6 +185,13 @@ def parse_arguments():
         'Unique name for target GPU type. Inferred from current GPU type if not specified.'
     )
     parser.add_argument(
+        '--strip_plan',
+        default=False,
+        action='store_true',
+        help=
+        'Whether to strip weights from the final TRT engine under the assumption that the refit weights will be identical to those provided at build time.'
+    )
+    parser.add_argument(
         '--max_encoder_input_len',
         type=int,
         default=1024,
@@ -224,6 +212,21 @@ def parse_arguments():
         help=
         'Run through the build process except the actual Engine build for debugging. '
     )
+    parser.add_argument('--speculative_decoding_mode',
+                        default=None,
+                        choices=[
+                            "draft_tokens_external",
+                            "lookahead_decoding",
+                            "medusa",
+                        ],
+                        help='Mode of speculative decoding.')
+    parser.add_argument(
+        '--weight_streaming',
+        default=False,
+        action='store_true',
+        help=
+        'Specify whether offloading weights to CPU and streaming loading at runtime.',
+    )
 
     plugin_config_parser = parser.add_argument_group("plugin_config")
     add_plugin_argument(plugin_config_parser)
@@ -233,6 +236,11 @@ def parse_arguments():
         args.gather_context_logits = True
         args.gather_generation_logits = True
 
+    if args.gather_context_logits and args.max_draft_len > 0:
+        raise RuntimeError(
+            "Gather context logits is not support with draft len > 0. "
+            "If want to get the accepted tokens' logits from target model, please just enable gather_generation_logits"
+        )
     return args
 
 
@@ -249,17 +257,7 @@ def build_model(build_config: BuildConfig,
                 model_config: Union[str, PretrainedConfig] = None,
                 model_cls=None,
                 **kwargs) -> Engine:
-    if ckpt_dir is not None:
-        model_config = PretrainedConfig.from_json_file(
-            os.path.join(ckpt_dir, 'config.json'))
-    else:
-        assert model_config is not None
-        if isinstance(model_config, PretrainedConfig):
-            model_config = model_config
-        else:
-            model_config = PretrainedConfig.from_json_file(model_config)
-
-    preprocess_model_config(model_config, **kwargs)
+    model_config = copy.deepcopy(model_config)
 
     logits_dtype = kwargs.get('logits_dtype')
     if logits_dtype is not None:
@@ -278,6 +276,10 @@ def build_model(build_config: BuildConfig,
         "StreamingLLM is only supported in the llama model."
     real_rank = rank
 
+    if build_config.plugin_config.reduce_fusion and model_config.mapping.tp_size == 1:
+        build_config.plugin_config.reduce_fusion = False
+
+    model_config.mapping.gpus_per_node = build_config.auto_parallel_config.gpus_per_node
     if build_config.auto_parallel_config.enabled:
         assert rank < build_config.auto_parallel_config.world_size
         assert model_config.mapping.pp_size == 1 and model_config.mapping.tp_size == 1, \
@@ -289,13 +291,20 @@ def build_model(build_config: BuildConfig,
 
     rank_config = copy.deepcopy(model_config)
     rank_config.set_rank(rank)
-    model = load_model(rank_config, ckpt_dir, model_cls)
+
+    assert architecture in MODEL_MAP, \
+        f"Unsupported model architecture: {architecture}"
+    model_cls = MODEL_MAP[architecture]
+    if ckpt_dir is None:
+        model = model_cls(rank_config)
+    else:
+        model = model_cls.from_checkpoint(ckpt_dir, config=rank_config)
+    is_checkpoint_pruned = getattr(rank_config, 'is_pruned', False)
 
     if build_config.plugin_config.lora_plugin is not None:
-        lora_config = LoraBuildConfig(
-            lora_dir=kwargs['lora_dir'] or [],
-            lora_ckpt_source=kwargs['lora_ckpt_source'],
-            max_lora_rank=kwargs['max_lora_rank'])
+        lora_config = LoraConfig(lora_dir=kwargs['lora_dir'] or [],
+                                 lora_ckpt_source=kwargs['lora_ckpt_source'],
+                                 max_lora_rank=kwargs['max_lora_rank'])
         if kwargs['lora_target_modules'] is not None:
             # command line options is preferred over the modules in the lora dir
             lora_config.lora_target_modules = kwargs['lora_target_modules']
@@ -305,6 +314,11 @@ def build_model(build_config: BuildConfig,
     # tells the low level build api to only build rank-th shard of the model
     if build_config.auto_parallel_config.enabled:
         model.config.mapping.rank = real_rank
+
+    if is_checkpoint_pruned or kwargs.pop('strip_plan', False):
+        build_config.use_strip_plan = True
+    build_config.use_refit = kwargs.get('refit', False)
+
     return build(model, build_config)
 
 
@@ -330,14 +344,14 @@ def parallel_build(ckpt_dir_or_model_config: str,
                    log_level: str = 'info',
                    model_cls=None,
                    **kwargs):
-    ckpt_dir = ckpt_dir_or_model_config
     if ckpt_dir_or_model_config.lower().endswith('.json'):
-        model_config = PretrainedConfig.from_json_file(ckpt_dir_or_model_config)
+        config_path = ckpt_dir_or_model_config
         ckpt_dir = None
     else:
-        model_config = PretrainedConfig.from_json_file(
-            os.path.join(ckpt_dir_or_model_config, 'config.json'))
+        config_path = os.path.join(ckpt_dir_or_model_config, 'config.json')
+        ckpt_dir = ckpt_dir_or_model_config
 
+    model_config = PretrainedConfig.from_json_file(config_path)
     preprocess_model_config(model_config, **kwargs)
 
     if build_config.auto_parallel_config.enabled:
@@ -404,25 +418,20 @@ def main():
         'lora_ckpt_source': args.lora_ckpt_source,
         'max_lora_rank': args.max_lora_rank,
         'lora_target_modules': args.lora_target_modules,
+        'strip_plan': args.strip_plan,
+        'refit': False,
     }
+    speculative_decoding_mode = SpeculativeDecodingMode.from_arguments(args)
     if args.build_config is None:
         if args.multiple_profiles == "enable" and args.opt_num_tokens is not None:
             raise RuntimeError(
                 "multiple_profiles is enabled, while opt_num_tokens is set. "
                 "They are not supposed to be working in the same time for now.")
-        args.max_num_tokens, args.opt_num_tokens = check_max_num_tokens(
-            max_num_tokens=args.max_num_tokens,
-            opt_num_tokens=args.opt_num_tokens,
-            max_batch_size=args.max_batch_size,
-            max_input_len=args.max_input_len,
-            max_beam_width=args.max_beam_width,
-            remove_input_padding=(args.remove_input_padding == "enable"),
-            enable_context_fmha=(args.context_fmha == "enable"),
-            tokens_per_block=args.tokens_per_block)
         if args.cluster_key is not None:
             cluster_config = dict(cluster_key=args.cluster_key)
         else:
             cluster_config = infer_cluster_config()
+
         build_config = BuildConfig.from_dict(
             {
                 'max_input_len': args.max_input_len,
@@ -435,12 +444,13 @@ def main():
                 args.max_prompt_embedding_table_size,
                 'gather_context_logits': args.gather_context_logits,
                 'gather_generation_logits': args.gather_generation_logits,
-                'strongly_typed': args.strongly_typed,
+                'strongly_typed': True,
                 'builder_opt': args.builder_opt,
                 'weight_sparsity': args.weight_sparsity,
                 'profiling_verbosity': args.profiling_verbosity,
                 'enable_debug_output': args.enable_debug_output,
                 'max_draft_len': args.max_draft_len,
+                'speculative_decoding_mode': speculative_decoding_mode,
                 'input_timing_cache': args.input_timing_cache,
                 'output_timing_cache': args.output_timing_cache,
                 'auto_parallel_config': {
@@ -460,6 +470,7 @@ def main():
                 'dry_run': args.dry_run,
                 'visualize_network': args.visualize_network,
                 'max_encoder_input_len': args.max_encoder_input_len,
+                'weight_streaming': args.weight_streaming,
             },
             plugin_config=plugin_config)
     else:

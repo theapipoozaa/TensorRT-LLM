@@ -19,22 +19,27 @@ import numpy as np
 import tensorrt as trt
 
 from .._common import default_net, precision
-from .._utils import (fp32_array, int32_array, is_same_dtype,
-                      numpy_fp32_to_bf16, preview_trt_version, trt_dtype_to_np,
-                      trt_dtype_to_str)
-from ..functional import (AttentionMaskType, PositionEmbeddingType,
+from .._utils import (fp32_array, int32_array, is_same_dtype, trt_dtype_to_np,
+                      trt_dtype_to_str, trt_gte_10)
+from ..functional import (ACT2FN, AllReduceFusionParams, AttentionMaskType,
+                          Conditional, PositionEmbeddingType,
                           RopeEmbeddingUtils, RotaryScalingType, Tensor, arange,
-                          bert_attention, cast, clip, concat, conditional,
-                          constant, embedding, expand, expand_dims, expand_mask,
+                          bert_attention, cast, clip, concat, constant,
+                          embedding, expand, expand_dims, expand_mask,
                           generate_alibi_biases, generate_alibi_slopes,
-                          gpt_attention, matmul, minimum, repeat_interleave,
-                          shape, slice, softmax, split, unsqueeze, where)
+                          gpt_attention, matmul)
+from ..functional import max as fmax
+from ..functional import (minimum, repeat_interleave, shape, slice, softmax,
+                          split, unsqueeze, where)
 from ..module import Module
 from ..parameter import Parameter
 from ..quantization import QuantMode
 from ..quantization.functional import dequantize, quantize
 from .linear import ColumnLinear, QKVColumnLinear, RowLinear
 from .lora import LoraRuntimeParams
+from .normalization import LayerNorm
+
+from ..functional import maximum  # isort:skip
 
 
 def make_causal_mask(bsz, tgt_len, past_key_values_length, dtype):
@@ -169,6 +174,18 @@ class AttentionParams(object):
         return True
 
 
+class SpecDecodingParams:
+
+    def __init__(self,
+                 spec_decoding_generation_lengths: Tensor = None,
+                 spec_decoding_position_offsets: Tensor = None,
+                 spec_decoding_packed_mask: Tensor = None):
+
+        self.spec_decoding_generation_lengths = spec_decoding_generation_lengths
+        self.spec_decoding_position_offsets = spec_decoding_position_offsets
+        self.spec_decoding_packed_mask = spec_decoding_packed_mask
+
+
 class KeyValueCacheParams:
 
     def __init__(self,
@@ -180,7 +197,10 @@ class KeyValueCacheParams:
                  host_kv_cache_block_offsets: Tensor = None,
                  host_kv_cache_pool_pointers: Tensor = None,
                  cache_indirection: Tensor = None,
-                 past_key_value_length: Tensor = None):
+                 past_key_value_length: Tensor = None,
+                 cross_kv_cache_block_offsets: Tensor = None,
+                 host_cross_kv_cache_block_offsets: Tensor = None,
+                 host_cross_kv_cache_pool_pointers: Tensor = None):
         self.past_key_value = past_key_value
         self.host_past_key_value_lengths = host_past_key_value_lengths
         self.host_max_attention_window_sizes = host_max_attention_window_sizes
@@ -188,6 +208,9 @@ class KeyValueCacheParams:
         self.kv_cache_block_offsets = kv_cache_block_offsets
         self.host_kv_cache_block_offsets = host_kv_cache_block_offsets
         self.host_kv_cache_pool_pointers = host_kv_cache_pool_pointers
+        self.cross_kv_cache_block_offsets = cross_kv_cache_block_offsets
+        self.host_cross_kv_cache_block_offsets = host_cross_kv_cache_block_offsets
+        self.host_cross_kv_cache_pool_pointers = host_cross_kv_cache_pool_pointers
         self.cache_indirection = cache_indirection
         # self.past_key_value_length = past_key_value_length
 
@@ -214,46 +237,69 @@ class KeyValueCacheParams:
         return True
 
 
+class BlockSparseAttnParams:
+
+    def __init__(self,
+                 block_size: int = 64,
+                 homo_head_pattern: bool = False,
+                 num_local_blocks: int = 16,
+                 vertical_stride: int = 8):
+        self.block_size = block_size
+        self.homo_head_pattern = homo_head_pattern
+        self.num_local_blocks = num_local_blocks
+        self.vertical_stride = vertical_stride
+
+
 class Attention(Module):
 
-    def __init__(
-        self,
-        *,
-        local_layer_idx,
-        hidden_size,
-        num_attention_heads,
-        num_kv_heads=None,
-        max_position_embeddings=1024,
-        num_layers=1,
-        apply_query_key_layer_scaling=False,
-        attention_head_size=None,
-        attention_mask_type=AttentionMaskType.padding,
-        bias=True,
-        dtype=None,
-        position_embedding_type=PositionEmbeddingType.learned_absolute,
-        rotary_embedding_base=10000.0,
-        rotary_embedding_scaling=None,
-        rotary_embedding_percentage=1.0,
-        tp_group=None,
-        tp_size=1,
-        tp_rank=0,
-        quant_mode: QuantMode = QuantMode(0),
-        q_scaling=1.0,
-        cross_attention=False,
-        relative_attention=False,
-        max_distance=0,
-        num_buckets=0,
-        dense_bias=None,
-        clip_qkv=None,
-        alibi_bias_max=8,
-        skip_cross_qkv=False,
-    ):
+    def __init__(self,
+                 *,
+                 local_layer_idx,
+                 hidden_size,
+                 num_attention_heads,
+                 num_kv_heads=None,
+                 max_position_embeddings=1024,
+                 num_layers=1,
+                 apply_query_key_layer_scaling=False,
+                 attention_head_size=None,
+                 qk_layernorm=False,
+                 inner_layernorm=False,
+                 eps=1e-05,
+                 attention_mask_type=AttentionMaskType.padding,
+                 bias=True,
+                 dtype=None,
+                 position_embedding_type=PositionEmbeddingType.learned_absolute,
+                 rotary_embedding_base=10000.0,
+                 rotary_embedding_scaling=None,
+                 rotary_embedding_percentage=1.0,
+                 rope_scaling_short_factors=None,
+                 rope_scaling_long_factors=None,
+                 rope_scaling_short_mscale=None,
+                 rope_scaling_long_mscale=None,
+                 original_max_position_embeddings=1024,
+                 tp_group=None,
+                 tp_size=1,
+                 tp_rank=0,
+                 quant_mode: QuantMode = QuantMode(0),
+                 q_scaling=1.0,
+                 cross_attention=False,
+                 relative_attention=False,
+                 max_distance=0,
+                 num_buckets=0,
+                 dense_bias=None,
+                 clip_qkv=None,
+                 alibi_bias_max=8,
+                 skip_cross_qkv=False,
+                 max_attn_value=0.0,
+                 block_sparse_params=None,
+                 use_implicit_relative_attention=False):
         super().__init__()
 
-        self.layer_idx = local_layer_idx
+        self.local_layer_idx = local_layer_idx
         self.cross_attention = cross_attention
         self.attention_mask_type = attention_mask_type
         self.attention_head_size = hidden_size // num_attention_heads if attention_head_size is None else attention_head_size
+        self.num_kv_heads = num_kv_heads
         assert num_attention_heads % tp_size == 0, \
         "num_attention_heads must be divisible by tp_size"
         self.num_attention_heads = num_attention_heads // tp_size
@@ -263,14 +309,15 @@ class Attention(Module):
         self.hidden_size = hidden_size
         self.attention_hidden_size = self.attention_head_size * self.num_attention_heads
         self.max_position_embeddings = max_position_embeddings
+        self.original_max_position_embeddings = original_max_position_embeddings
         self.bias = bias
         self.tp_group = tp_group
         self.tp_size = tp_size
         self.tp_rank = tp_rank
         self.dtype = dtype
+        self.dense_bias = dense_bias
         if dense_bias is None:
-            dense_bias = bias
-        self.unfuse_qkv_gemm = False
+            self.dense_bias = bias
 
         self.num_layers = num_layers
         self.apply_query_key_layer_scaling = apply_query_key_layer_scaling
@@ -295,6 +342,7 @@ class Attention(Module):
         self.rotary_embedding_scale_type = RotaryScalingType.none
         self.rotary_embedding_scale = 1.0
         self.rotary_embedding_percentage = rotary_embedding_percentage
+        self.use_implicit_relative_attention = self.relative_attention and use_implicit_relative_attention
         if rotary_embedding_scaling is not None:
             assert rotary_embedding_scaling["type"] in ["linear", "dynamic"]
             self.rotary_embedding_scale_type = RotaryScalingType.linear if rotary_embedding_scaling[
@@ -302,25 +350,104 @@ class Attention(Module):
             self.rotary_embedding_scale = rotary_embedding_scaling["factor"]
             assert self.rotary_embedding_scale > 1.0
 
-        self.embed_positions = None
-        self.rotary_enabled = False
         self.rotary_embedding_dim = 0
-
         if self.position_embedding_type.is_rope():
             self.rotary_embedding_dim = int(self.attention_head_size *
                                             rotary_embedding_percentage)
-            self.rotary_enabled = True
-            self.embed_positions = RopeEmbeddingUtils.create_sinusoidal_positions(
-                self.max_position_embeddings,
-                self.rotary_embedding_dim,
-            )
-            self.embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
-                self.max_position_embeddings, self.rotary_embedding_dim,
-                self.rotary_embedding_base, self.rotary_embedding_scale,
-                self.rotary_embedding_scale_type)
+
+            if self.position_embedding_type == PositionEmbeddingType.long_rope:
+                embed_positions_short_factors, embed_positions_long_factors, \
+                embed_positions_short_factors_for_attention_plugin, \
+                embed_positions_long_factors_for_attention_plugin, mscale \
+                    = RopeEmbeddingUtils.create_sinusoidal_positions_long_rope(
+                    self.max_position_embeddings,
+                    original_max_position_embeddings, self.rotary_embedding_dim,
+                    self.rotary_embedding_base, rope_scaling_short_factors,
+                    rope_scaling_long_factors, rope_scaling_short_mscale, rope_scaling_long_mscale)
+
+                if rope_scaling_short_mscale is not None:
+                    assert rope_scaling_long_mscale is not None
+                    short_mscale = rope_scaling_short_mscale
+                    long_mscale = rope_scaling_long_mscale
+                else:
+                    short_mscale = long_mscale = mscale
+
+                rope_scaling_short_factors = np.array(
+                    rope_scaling_short_factors).reshape(1, -1)
+                rope_scaling_long_factors = np.array(
+                    rope_scaling_long_factors).reshape(1, -1)
+
+                self.register_parameter(
+                    'embed_positions_short_factors',
+                    Parameter(embed_positions_short_factors,
+                              dtype='float32',
+                              is_buffer=True))
+                self.register_parameter(
+                    'embed_positions_long_factors',
+                    Parameter(embed_positions_long_factors,
+                              dtype='float32',
+                              is_buffer=True))
+                self.register_parameter(
+                    'embed_positions_short_factors_for_attention_plugin',
+                    Parameter(
+                        embed_positions_short_factors_for_attention_plugin,
+                        dtype='float32',
+                        is_buffer=True))
+                self.register_parameter(
+                    'embed_positions_long_factors_for_attention_plugin',
+                    Parameter(embed_positions_long_factors_for_attention_plugin,
+                              dtype='float32',
+                              is_buffer=True))
+                self.short_mscale = short_mscale
+                self.long_mscale = long_mscale
+                self.register_parameter(
+                    'rope_scaling_short_factors',
+                    Parameter(rope_scaling_short_factors,
+                              dtype='float32',
+                              is_buffer=True))
+                self.register_parameter(
+                    'rope_scaling_long_factors',
+                    Parameter(rope_scaling_long_factors,
+                              dtype='float32',
+                              is_buffer=True))
+            else:
+                # Rotary cos/sin cache.
+                embed_positions = RopeEmbeddingUtils.create_sinusoidal_positions(
+                    self.max_position_embeddings,
+                    self.rotary_embedding_dim,
+                )
+                self.register_parameter(
+                    'embed_positions',
+                    Parameter(embed_positions, dtype='float32', is_buffer=True))
+                embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
+                    self.max_position_embeddings, self.rotary_embedding_dim,
+                    self.rotary_embedding_base, self.rotary_embedding_scale,
+                    self.rotary_embedding_scale_type)
+                self.register_parameter(
+                    'embed_positions_for_gpt_attention',
+                    Parameter(embed_positions_for_gpt_attention,
+                              dtype='float32',
+                              is_buffer=True))
+
+        elif self.position_embedding_type.is_alibi():
+            alibi_scale = 1. / self.norm_factor if self.scale_alibi_bias else 1.
+            alibi_slopes = generate_alibi_slopes(
+                self.num_attention_heads * self.tp_size,
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
+                alibi_scale=alibi_scale,
+                alibi_bias_max=self.alibi_bias_max)
+            self.register_parameter(
+                'alibi_slopes',
+                Parameter(alibi_slopes, dtype='float32', is_buffer=True))
 
         self.quant_mode = quant_mode
+        self.max_attn_value = max_attn_value
         self.register_parameter('kv_cache_scaling_factor', None)
+        self.register_parameter('attention_output_orig_quant_scale', None)
+
+        self.block_sparse_params = block_sparse_params if block_sparse_params is not None else BlockSparseAttnParams(
+        )
 
         # The output feature size is therefore (h/tp + 2*kvh/tp) * d, where h is num_heads,
         # d is head_size, kvh is the num_kv_heads and tp is tensor_parallel_size.
@@ -328,7 +455,7 @@ class Attention(Module):
         # which matches the desired output size (h/tp + 2*kvh/tp) * d after splitting
 
         # out dim is not necessarily hidden_size + kv specific size (in MQA/GQA), but num_heads * heads_size
-        # example: d_model != num_heads * head_size in Flan-T5
+        # example: d_model != num_heads * head_size in Flan-T5/ByT5/Gemma
         self.qkv = QKVColumnLinear(
             hidden_size,
             tp_size * self.num_attention_heads * self.attention_head_size +
@@ -342,17 +469,25 @@ class Attention(Module):
         self.dense = RowLinear(tp_size * self.num_attention_heads *
                                self.attention_head_size,
                                hidden_size,
-                               bias=dense_bias,
+                               bias=self.dense_bias,
                                dtype=dtype,
                                tp_group=tp_group,
                                tp_size=tp_size)
 
+        # see optimize_model's add_lora for LoRA initialization
+        self.qkv_lora = None
+
         # per-layer relative attention table
-        if relative_attention:
+        if self.use_implicit_relative_attention:
             self.rel_attn_table = Parameter(shape=(num_attention_heads //
                                                    tp_size, num_buckets),
                                             dtype=dtype)
-
+        self.qk_layernorm = qk_layernorm
+        if self.qk_layernorm:
+            self.q_layernorm = LayerNorm(self.attention_head_size, dtype=dtype)
+            self.k_layernorm = LayerNorm(self.attention_head_size, dtype=dtype)
+        self.inner_layernorm = LayerNorm(self.hidden_size, dtype=dtype,
+                                         eps=eps) if inner_layernorm else None
         if clip_qkv is not None:
             self.clip_qkv = fp32_array([clip_qkv])
         else:
@@ -363,9 +498,8 @@ class Attention(Module):
     def forward(self,
                 hidden_states: Tensor,
                 attention_mask=None,
-                medusa_packed_mask=None,
-                medusa_position_offsets=None,
                 use_cache=False,
+                spec_decoding_params=None,
                 kv_cache_params=None,
                 attention_params=None,
                 encoder_output: Optional[Tensor] = None,
@@ -373,23 +507,19 @@ class Attention(Module):
                 norm_before_bmm1=False,
                 lora_layer_params=None,
                 cross_kv_cache_gen: Optional[Tensor] = None,
-                cross_qkv_reuse: Optional[Tensor] = None):
+                cross_qkv_reuse: Optional[Tensor] = None,
+                reduce_fusion_params: Optional[AllReduceFusionParams] = None):
 
         assert isinstance(hidden_states, Tensor)
 
+        spec_decoding_params = SpecDecodingParams(
+        ) if spec_decoding_params is None else spec_decoding_params
+
         alibi_slopes = None
         if self.position_embedding_type.is_alibi():
-            dtype = trt.float32
+            alibi_slopes = self.alibi_slopes.value
             if default_net().plugin_config.gpt_attention_plugin:
-                dtype = hidden_states.dtype
-            alibi_scale = 1. / self.norm_factor if self.scale_alibi_bias else 1.
-            alibi_slopes = generate_alibi_slopes(
-                self.num_attention_heads * self.tp_size,
-                dtype=dtype,
-                tp_size=self.tp_size,
-                tp_rank=self.tp_rank,
-                alibi_scale=alibi_scale,
-                alibi_bias_max=self.alibi_bias_max)
+                alibi_slopes = cast(alibi_slopes, hidden_states.dtype)
 
         qkv_lora_params = None
         if lora_layer_params is not None:
@@ -400,7 +530,7 @@ class Attention(Module):
                 qkv_lora_params = lora_layer_params.get_runtime_params(
                     0, "cross_attn_qkv")
 
-        unfuse_qkv_gemm = self.unfuse_qkv_gemm
+        unfuse_qkv_gemm = self.qkv is None
         if unfuse_qkv_gemm:
             qkv_gemm = [self.q, self.k, self.v]
             qkv = [gemm(hidden_states) for gemm in qkv_gemm]
@@ -449,12 +579,13 @@ class Attention(Module):
                 qkv_lora_runtime_params = LoraRuntimeParams(
                     lora_ranks=[
                         q_lora_params.lora_ranks[0],
-                        k_lora_params.lora_ranks[0], v_lora_params.lora_ranks[0]
+                        k_lora_params.lora_ranks[0],
+                        v_lora_params.lora_ranks[0],
                     ],
                     lora_weights_pointers=[
                         q_lora_params.lora_weights_pointers[0],
                         k_lora_params.lora_weights_pointers[0],
-                        v_lora_params.lora_weights_pointers[0]
+                        v_lora_params.lora_weights_pointers[0],
                     ],
                     host_request_types=q_lora_params.host_request_types,
                     host_context_lengths=q_lora_params.host_context_lengths,
@@ -470,7 +601,29 @@ class Attention(Module):
                 qkv_lora = concat([q_lora, k_lora, v_lora],
                                   dim=q_lora.rank() - 1)
                 qkv = qkv + qkv_lora
+        if self.qk_layernorm:
+            base_shape = shape(qkv, 0) if qkv.ndim() == 2 else concat(
+                [shape(qkv, 0), shape(qkv, 1)])
+            # here we assume that q, k and v have the same number of attention heads
+            # TODO: allow different number of attention heads for q, k and v.
+            qkv = qkv.view(
+                concat([
+                    base_shape, self.num_attention_heads, 3,
+                    self.attention_head_size
+                ]))
 
+            query, key, value = split(qkv, 1, dim=qkv.ndim() - 2)
+            q_shape = concat([
+                base_shape, self.num_attention_heads, self.attention_head_size
+            ])
+            query = query.view(q_shape)
+            key = key.view(q_shape)
+            value = value.view(q_shape)
+
+            query = self.q_layernorm(query)
+            key = self.k_layernorm(key)
+            qkv = concat([query, key, value], dim=query.ndim() - 2)
+            qkv = qkv.view(concat([base_shape, self.attention_hidden_size * 3]))
         if self.position_embedding_type == PositionEmbeddingType.chatglm:
             qkv = RopeEmbeddingUtils.apply_rotary_pos_emb_chatglm(
                 qkv,
@@ -505,40 +658,48 @@ class Attention(Module):
         if self.cross_attention and encoder_output:
             assert isinstance(encoder_output, Tensor)
 
-            ## True branch: context phase, compute cross qkv
-            cross_qkv_true = self.qkv(encoder_output, qkv_lora_params)
+            def compute_cross_qkv(encoder_output):
+                cross_qkv = self.qkv(encoder_output, qkv_lora_params)
 
-            if default_net(
-            ).plugin_config.lora_plugin and qkv_lora_params is None and lora_layer_params is not None:
-                cross_q_lora, cross_k_lora, cross_v_lora = self.qkv_lora(
-                    encoder_output,
-                    qkv_lora_runtime_params,
-                    is_cross_attention=True)
-                cross_qkv_lora = concat(
-                    [cross_q_lora, cross_k_lora, cross_v_lora],
-                    dim=cross_q_lora.rank() - 1)
-                cross_qkv_true = cross_qkv_true + cross_qkv_lora
-            ## End True branch
+                if default_net(
+                ).plugin_config.lora_plugin and qkv_lora_params is None and lora_layer_params is not None:
+                    cross_q_lora, cross_k_lora, cross_v_lora = self.qkv_lora(
+                        encoder_output,
+                        qkv_lora_runtime_params,
+                        is_cross_attention=True)
+                    cross_qkv_lora = concat(
+                        [cross_q_lora, cross_k_lora, cross_v_lora],
+                        dim=cross_q_lora.rank() - 1)
+                    cross_qkv = cross_qkv + cross_qkv_lora
 
-            ## False branch: generation phase, no compute but need to obey shape constraints
-            # because TRT's IfConditional requires the output shape of two subgraphs to be identical
-            # our 1st attempt was to stack encoder_output [B, S, H] or [N, H] --> cross qkv [B, S, 3*H] or [N, 3*H], but it still introduces unnecessary concat. A better solution is to create a dummy torch tensor `cross_qkv_resue` with the correct shape and reuse it in every generation step
-            cross_qkv_false = cross_qkv_reuse
-            ## End False branch
+                return cross_qkv
 
-            # IfConditional layer
             if self.skip_cross_qkv:
-                cross_qkv = conditional(cross_kv_cache_gen, cross_qkv_true,
-                                        cross_qkv_false)
+                conditional = Conditional(cross_kv_cache_gen)
+                cond_in1 = conditional.add_input(encoder_output)
+                cond_in2 = conditional.add_input(cross_qkv_reuse)
+
+                ## True branch: context phase, compute cross qkv
+                cross_qkv_true = compute_cross_qkv(cond_in1)
+
+                ## False branch: generation phase, no compute but need to obey shape constraints
+                # because TRT's IfConditional requires the output shape of two subgraphs to be identical
+                # our 1st attempt was to stack encoder_output [B, S, H] or [N, H] --> cross qkv [B, S, 3*H] or [N, 3*H],
+                # but it still introduces unnecessary concat. A better solution is to create a dummy torch tensor `cross_qkv_resue`
+                # with the correct shape and reuse it in every generation step
+                cross_qkv_false = cond_in2
+                cross_qkv = conditional.add_output(cross_qkv_true,
+                                                   cross_qkv_false)
             else:
-                cross_qkv = cross_qkv_true
+                cross_qkv = compute_cross_qkv(encoder_output)
 
         if default_net().plugin_config.gpt_attention_plugin:
             if self.cross_attention and (past_key_value is not None):
                 past_key_value = kv_cache_params.past_key_value[1]
             assert self.attention_mask_type in [
                 AttentionMaskType.causal, AttentionMaskType.bidirectional,
-                AttentionMaskType.bidirectionalglm
+                AttentionMaskType.bidirectionalglm,
+                AttentionMaskType.blocksparse
             ], 'Plugin only support masked MHA.'
 
             # KV cache scales.
@@ -556,19 +717,53 @@ class Attention(Module):
             ) or self.quant_mode.has_fp8_qdq(
             ), "FP8 Context FMHA must be used together with the fp8 quantization workflow."
 
-            if self.quant_mode.has_fp8_qdq() and default_net(
-            ).plugin_config.use_fp8_context_fmha:
-                # the attention plugin only quantizes the output when fp8 context fmha is enabled.
-                attention_output_orig_quant_scale = constant(
-                    fp32_array([1.0] /
-                               self.dense.activation_scaling_factor.raw_value))
-            else:
-                attention_output_orig_quant_scale = None
+            attention_output_orig_quant_scale = self.attention_output_orig_quant_scale.value if self.attention_output_orig_quant_scale is not None else None
 
-            # Rotary cos/sin cache.
-            rotary_cos_sin = constant(
-                self.embed_positions_for_gpt_attention
-            ) if self.position_embedding_type.is_rope() else None
+            if self.position_embedding_type == PositionEmbeddingType.long_rope:
+                short = slice(
+                    self.embed_positions_short_factors_for_attention_plugin.
+                    value, concat([0, 0, 0]),
+                    concat([
+                        max(attention_params.sequence_length,
+                            self.original_max_position_embeddings),
+                        self.rotary_embedding_dim // 2, 2
+                    ]))
+                long = slice(
+                    self.embed_positions_long_factors_for_attention_plugin.
+                    value, concat([0, 0, 0]),
+                    concat([
+                        max(attention_params.sequence_length,
+                            self.original_max_position_embeddings),
+                        self.rotary_embedding_dim // 2, 2
+                    ]))
+                short = short.view((1, -1))
+                long = long.view((1, -1))
+                embed_positions = concat([short, long], dim=0)
+                select = where(
+                    fmax(attention_params.sequence_length, dim=0) <=
+                    self.original_max_position_embeddings, 0, 1)
+                rotary_cos_sin = slice(embed_positions,
+                                       concat([select, 0]),
+                                       sizes=concat([1, shape(long, 1)]))
+                short_factors = self.rope_scaling_short_factors.value
+                long_factors = self.rope_scaling_long_factors.value
+                scale_factors = concat([short_factors, long_factors], dim=0)
+                rope_scaling_factors = slice(scale_factors,
+                                             concat([select, 0]),
+                                             sizes=concat(
+                                                 [1, shape(long_factors, 1)]))
+                rope_scaling_factors = rope_scaling_factors.view((-1, ))
+            else:
+                # Rotary cos/sin cache.
+                rotary_cos_sin = self.embed_positions_for_gpt_attention.value if self.position_embedding_type.is_rope(
+                ) else None
+                rope_scaling_factors = None
+
+            if self.position_embedding_type == PositionEmbeddingType.long_rope:
+                short_mscale, long_mscale = self.short_mscale, self.long_mscale
+            else:
+                short_mscale, long_mscale = None, None
+
             context, past_key_value = gpt_attention(
                 qkv=qkv,
                 past_key_value=past_key_value,
@@ -581,7 +776,7 @@ class Attention(Module):
                 context_lengths=attention_params.context_lengths,
                 cache_indirection=kv_cache_params.cache_indirection,
                 host_request_types=attention_params.host_request_types,
-                layer_idx=self.layer_idx,
+                layer_idx=self.local_layer_idx,
                 num_heads=self.num_attention_heads,
                 num_kv_heads=self.num_attention_kv_heads,
                 hidden_size_per_head=self.attention_head_size,
@@ -589,8 +784,13 @@ class Attention(Module):
                 rotary_embedding_dim=self.rotary_embedding_dim,
                 rotary_embedding_base=self.rotary_embedding_base,
                 rotary_embedding_scale_type=self.rotary_embedding_scale_type,
+                rotary_embedding_scaling_factors=rope_scaling_factors,
+                rotary_embedding_short_m_scale=short_mscale,
+                rotary_embedding_long_m_scale=long_mscale,
                 rotary_embedding_scale=self.rotary_embedding_scale,
                 rotary_embedding_max_positions=self.max_position_embeddings,
+                rotary_embedding_original_max_positions=self.
+                original_max_position_embeddings,
                 position_embedding_type=self.position_embedding_type,
                 rotary_cos_sin=rotary_cos_sin,
                 kv_orig_quant_scale=kv_orig_quant_scale,
@@ -600,14 +800,25 @@ class Attention(Module):
                 kv_cache_quant_mode=self.quant_mode,
                 max_context_length=attention_params.max_context_length,
                 mask_type=self.attention_mask_type,
+                block_sparse_block_size=self.block_sparse_params.block_size,
+                block_sparse_homo_head_pattern=self.block_sparse_params.
+                homo_head_pattern,
+                block_sparse_num_local_blocks=self.block_sparse_params.
+                num_local_blocks,
+                block_sparse_vertical_stride=self.block_sparse_params.
+                vertical_stride,
                 alibi_slopes=alibi_slopes,
                 tp_size=self.tp_size,
                 tp_rank=self.tp_rank,
-                kv_cache_block_offsets=kv_cache_params.kv_cache_block_offsets,
+                kv_cache_block_offsets=kv_cache_params.kv_cache_block_offsets
+                if not self.cross_attention else
+                kv_cache_params.cross_kv_cache_block_offsets,
                 host_kv_cache_block_offsets=kv_cache_params.
-                host_kv_cache_block_offsets,
+                host_kv_cache_block_offsets if not self.cross_attention else
+                kv_cache_params.host_cross_kv_cache_block_offsets,
                 host_kv_cache_pool_pointers=kv_cache_params.
-                host_kv_cache_pool_pointers,
+                host_kv_cache_pool_pointers if not self.cross_attention else
+                kv_cache_params.host_cross_kv_cache_pool_pointers,
                 do_cross_attention=self.cross_attention,
                 cross_qkv=cross_qkv,
                 cross_qkv_length=attention_params.encoder_max_input_length,
@@ -617,9 +828,13 @@ class Attention(Module):
                 max_distance=self.max_distance,
                 host_context_lengths=attention_params.host_context_lengths,
                 use_cache=use_cache,
-                medusa_position_offsets=medusa_position_offsets,
-                medusa_packed_mask=medusa_packed_mask,
-            )
+                spec_decoding_generation_lengths=spec_decoding_params.
+                spec_decoding_generation_lengths,
+                spec_decoding_position_offsets=spec_decoding_params.
+                spec_decoding_position_offsets,
+                spec_decoding_packed_mask=spec_decoding_params.
+                spec_decoding_packed_mask,
+                qk_tanh_scale=self.max_attn_value)
 
         else:
             # plain TensorRT mode
@@ -658,21 +873,47 @@ class Attention(Module):
                     encoder_qkv, [self.attention_hidden_size, kv_size, kv_size],
                     dim=2)
 
-            query = transpose_for_scores(query, rotary=self.rotary_enabled)
-            key = transpose_for_scores(key,
-                                       is_kv=True,
-                                       rotary=self.rotary_enabled)
+            query = transpose_for_scores(
+                query, rotary=self.position_embedding_type.is_rope())
+            key = transpose_for_scores(
+                key, is_kv=True, rotary=self.position_embedding_type.is_rope())
             value = transpose_for_scores(value, is_kv=True)
 
-            if self.rotary_enabled:
-                if is_same_dtype(self.dtype, trt.bfloat16):
-                    embed_positions = numpy_fp32_to_bf16(
-                        self.embed_positions.astype(np.float32))
-                    embed_positions = constant(embed_positions)
+            if self.position_embedding_type.is_rope():
+                if self.position_embedding_type == PositionEmbeddingType.long_rope:
+                    sequence_length = shape(hidden_states, 1)
+                    short = slice(
+                        self.embed_positions_short_factors.value,
+                        concat([0, 0, 0]),
+                        concat([
+                            1,
+                            max(sequence_length,
+                                self.original_max_position_embeddings),
+                            self.rotary_embedding_dim
+                        ]))
+                    long = slice(
+                        self.embed_positions_long_factors.value,
+                        concat([0, 0, 0]),
+                        concat([
+                            1,
+                            max(sequence_length,
+                                self.original_max_position_embeddings),
+                            self.rotary_embedding_dim
+                        ]))
+                    embed_positions = concat([short, long], dim=0)
+                    select = where(
+                        sequence_length <=
+                        self.original_max_position_embeddings, 0, 1)
+                    embed_positions = slice(embed_positions,
+                                            concat([select, 0, 0]),
+                                            sizes=shape(short))
+                    embed_positions = cast(embed_positions, self.dtype)
+                elif is_same_dtype(self.dtype, trt.bfloat16):
+                    embed_positions = cast(self.embed_positions.value,
+                                           trt.bfloat16)
                 else:
-                    embed_positions = constant(
-                        self.embed_positions.astype(trt_dtype_to_np(
-                            query.dtype)))
+                    embed_positions = cast(self.embed_positions.value,
+                                           query.dtype)
 
                 if self.rotary_embedding_dim is not None:
                     # When shape(hidden_states, 1) > 1(Context phase), the embedding start from 0,
@@ -799,7 +1040,8 @@ class Attention(Module):
                     query_length = shape(query, 2)
                     # bsz, tatget_length, past_key_value_length
                     buffer = make_causal_mask(shape(query, 0), query_length,
-                                              key_length - query_length, dtype)
+                                              key_length - query_length,
+                                              trt.float32)
                     starts = concat([0, 0, 0, 0])
                     sizes = concat([1, 1, query_length, key_length])
                     generated_mask = slice(buffer, starts, sizes)
@@ -808,12 +1050,14 @@ class Attention(Module):
                     query_length = shape(query, 2)
                     starts = concat([0, 0, key_length - query_length, 0])
                     sizes = concat([1, 1, query_length, key_length])
+                    if self.position_embedding_type == PositionEmbeddingType.long_rope:
+                        buf_shape = (self.original_max_position_embeddings,
+                                     self.original_max_position_embeddings)
+                    else:
+                        buf_shape = (self.max_position_embeddings,
+                                     self.max_position_embeddings)
                     select_buf = np.expand_dims(
-                        np.tril(
-                            np.ones(
-                                (self.max_position_embeddings,
-                                 self.max_position_embeddings))).astype(bool),
-                        (0, 1))
+                        np.tril(np.ones(buf_shape)).astype(bool), (0, 1))
 
                     select_buf = np.logical_not(select_buf)
                     mask_buf = np.zeros_like(select_buf, np.float32)
@@ -860,21 +1104,23 @@ class Attention(Module):
 
             if self.relative_attention:
                 query_length = shape(query, 2)
-                relative_bias = compute_relative_bias(
-                    query_length + key_length - 1,
-                    key_length,
-                    self.num_buckets,
-                    self.max_distance,
-                    False,  # bidirectional
-                    self.rel_attn_table.value.transpose(1, 0),
-                    tp_size=self.tp_size,
-                    tp_group=self.tp_group,
-                    tp_rank=self.tp_rank)
+                if self.use_implicit_relative_attention:
+                    relative_bias = compute_relative_bias(
+                        query_length + key_length - 1,
+                        key_length,
+                        self.num_buckets,
+                        self.max_distance,
+                        False,  # bidirectional
+                        self.rel_attn_table.value.transpose(1, 0),
+                        tp_size=self.tp_size,
+                        tp_group=self.tp_group,
+                        tp_rank=self.tp_rank)
+                else:
+                    relative_bias = unsqueeze(self.rel_attn_table.value, 0)
                 start = concat([0, 0, query_length + key_length - 2, 0])
                 size = concat([
                     shape(relative_bias, 0),
-                    shape(relative_bias, 1), 1,
-                    shape(relative_bias, 3)
+                    shape(relative_bias, 1), 1, key_length
                 ])
                 relative_bias = slice(relative_bias, start, size)
 
@@ -883,8 +1129,7 @@ class Attention(Module):
                 if norm_before_bmm1:
                     # Apply norm on query earlier to prevent matmul fp16 overflow.
                     query /= (self.q_scaling * self.norm_factor)
-                if preview_trt_version(
-                ) or self.position_embedding_type.is_alibi():
+                if trt_gte_10() or self.position_embedding_type.is_alibi():
                     attention_scores = matmul(query, key)
                 else:
                     # For TRT 9.x, OOTB need this WAR to fuse mha.
@@ -893,6 +1138,9 @@ class Attention(Module):
                 if not norm_before_bmm1:
                     attention_scores = attention_scores / (self.q_scaling *
                                                            self.norm_factor)
+                if self.max_attn_value > 0:
+                    attention_scores = self.max_attn_value * ACT2FN['tanh'](
+                        attention_scores / self.max_attn_value)
 
                 if self.attention_mask_type in [
                         AttentionMaskType.causal,
@@ -910,7 +1158,7 @@ class Attention(Module):
 
             attention_probs = softmax(attention_scores, dim=-1)
 
-            if preview_trt_version() or self.position_embedding_type.is_alibi():
+            if trt_gte_10() or self.position_embedding_type.is_alibi():
                 # For trt_version() == 9.x and pos_embed == alibi, TRT has gpu buffer management issues. Need this WAR to avoid peak gpu mem regression.
                 # A dummy reshape WAR for mha fusion for 10.0
                 attention_probs = attention_probs.view(
@@ -938,12 +1186,24 @@ class Attention(Module):
         if lora_layer_params is not None:
             dense_lora_params = lora_layer_params.get_runtime_params(
                 0, "attn_dense")
-        context = self.dense(context, lora_runtime_params=dense_lora_params)
+
+        if self.inner_layernorm is not None:
+            context = self.inner_layernorm(context)
+        context = self.dense(context,
+                             lora_runtime_params=dense_lora_params,
+                             reduce_fusion_params=reduce_fusion_params)
 
         if use_cache:
             return (context, past_key_value)
         else:
             return context
+
+    def set_rel_attn_table(self, max_seq_len, precomputed_relative_attention):
+        self.rel_attn_table = Parameter(shape=(self.num_attention_heads,
+                                               max_seq_len + 1,
+                                               max_seq_len + 1),
+                                        dtype=self.dtype)
+        self.rel_attn_table.value = precomputed_relative_attention
 
 
 class BertAttention(Module):
@@ -1013,6 +1273,9 @@ class BertAttention(Module):
                                tp_group=tp_group,
                                tp_size=tp_size)
 
+        # see optimize_model's add_lora for LoRA initialization
+        self.qkv_lora = None
+
         # per-layer relative attention table
         if relative_attention:
             self.rel_attn_table = Parameter(shape=(num_attention_heads //
@@ -1050,12 +1313,13 @@ class BertAttention(Module):
                 qkv_lora_params = LoraRuntimeParams(
                     lora_ranks=[
                         q_lora_params.lora_ranks[0],
-                        k_lora_params.lora_ranks[0], v_lora_params.lora_ranks[0]
+                        k_lora_params.lora_ranks[0],
+                        v_lora_params.lora_ranks[0],
                     ],
                     lora_weights_pointers=[
                         q_lora_params.lora_weights_pointers[0],
                         k_lora_params.lora_weights_pointers[0],
-                        v_lora_params.lora_weights_pointers[0]
+                        v_lora_params.lora_weights_pointers[0],
                     ],
                     host_request_types=q_lora_params.host_request_types,
                     host_context_lengths=q_lora_params.host_context_lengths,
@@ -1140,3 +1404,212 @@ class BertAttention(Module):
         context = self.dense(context, lora_runtime_params=dense_lora_params)
 
         return context
+
+
+class CogVLMAttention(Attention):
+
+    def __init__(
+            self,
+            *,
+            local_layer_idx,
+            hidden_size,
+            num_attention_heads,
+            num_kv_heads=None,
+            max_position_embeddings=1024,
+            attention_mask_type=AttentionMaskType.causal,
+            bias=True,
+            dtype=None,
+            rotary_embedding_base=10000.0,
+            rotary_embedding_scaling=None,
+            tp_group=None,
+            tp_size=1,
+            tp_rank=0,
+            vision_start=1,
+            vision_length=1225,
+            quant_mode: QuantMode = QuantMode(0),
+            dense_bias=None,
+    ):
+        super().__init__(
+            local_layer_idx=local_layer_idx,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            num_kv_heads=num_kv_heads,
+            max_position_embeddings=max_position_embeddings,
+            dtype=dtype,
+            attention_mask_type=attention_mask_type,
+            bias=bias,
+            position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
+            rotary_embedding_base=rotary_embedding_base,
+            rotary_embedding_scaling=rotary_embedding_scaling,
+            tp_group=tp_group,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            quant_mode=quant_mode)
+
+        self.vision_length = vision_length
+        self.vision_start = vision_start
+
+        self.vis_qkv = QKVColumnLinear(
+            hidden_size,
+            tp_size * self.num_attention_heads * self.attention_head_size +
+            (2 * tp_size * self.num_attention_kv_heads *
+             self.attention_head_size),
+            bias=bias,
+            dtype=dtype,
+            tp_group=tp_group,
+            tp_size=tp_size,
+            gather_output=False)
+        self.vis_dense = RowLinear(tp_size * self.num_attention_heads *
+                                   self.attention_head_size,
+                                   hidden_size,
+                                   bias=self.dense_bias,
+                                   dtype=dtype,
+                                   tp_group=tp_group,
+                                   tp_size=tp_size)
+        embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_cogvlm_attention_plugin(
+            self.max_position_embeddings, self.rotary_embedding_dim,
+            self.rotary_embedding_base, self.rotary_embedding_scale,
+            self.rotary_embedding_scale_type, self.vision_start,
+            self.vision_length)
+        self.register_parameter(
+            'embed_positions_for_gpt_attention',
+            Parameter(embed_positions_for_gpt_attention, dtype='float32'))
+
+    def forward(self,
+                hidden_states: Tensor,
+                use_cache=False,
+                kv_cache_params=None,
+                attention_params=None):
+
+        assert isinstance(hidden_states, Tensor)
+        assert (not default_net().plugin_config.remove_input_padding)
+        assert (default_net().plugin_config.gpt_attention_plugin)
+
+        bs = shape(hidden_states, 0)
+        seq_length = shape(hidden_states, 1)
+        bos = slice(hidden_states, [0, 0, 0],
+                    concat([bs, self.vision_start, self.hidden_size]))
+        vis_seq_length = minimum(self.vision_length + 1, seq_length - 1)
+        vision_hidden_states = slice(
+            hidden_states, [0, self.vision_start, 0],
+            concat([bs, vis_seq_length, self.hidden_size]))
+        text_seq_length = maximum(
+            0, seq_length - (self.vision_length + 1 + self.vision_start))
+        language_hidden_states = slice(
+            hidden_states, [0, self.vision_length + 1 + self.vision_start, 0],
+            concat([bs, text_seq_length, self.hidden_size]))
+        bos_qkv = self.qkv(bos)
+        language_qkv = self.qkv(language_hidden_states)
+        vision_qkv = self.vis_qkv(vision_hidden_states)
+        qkv = concat([bos_qkv, vision_qkv, language_qkv], dim=1)
+
+        assert attention_params is None or attention_params.is_valid(
+            default_net().plugin_config.gpt_attention_plugin,
+            default_net().plugin_config.remove_input_padding)
+        assert kv_cache_params is None or kv_cache_params.is_valid(
+            default_net().plugin_config.gpt_attention_plugin)
+
+        past_key_value = None if kv_cache_params is None else kv_cache_params.get_first_past_key_value(
+        )
+
+        if default_net().plugin_config.gpt_attention_plugin:
+            if self.cross_attention and (past_key_value is not None):
+                past_key_value = kv_cache_params.past_key_value[1]
+            assert self.attention_mask_type in [
+                AttentionMaskType.causal, AttentionMaskType.bidirectional,
+                AttentionMaskType.bidirectionalglm
+            ], 'Plugin only support masked MHA.'
+
+            # KV cache scales.
+            kv_orig_quant_scale = constant(
+                fp32_array([1.0])
+            ) / self.kv_cache_scaling_factor.value if self.quant_mode.has_kv_cache_quant(
+            ) else None
+            kv_quant_orig_scale = self.kv_cache_scaling_factor.value if self.quant_mode.has_kv_cache_quant(
+            ) else None
+
+            # Attention output scales
+            assert (
+                not default_net().plugin_config.use_fp8_context_fmha
+            ) or self.quant_mode.has_fp8_qdq(
+            ), "FP8 Context FMHA must be used together with the fp8 quantization workflow."
+
+            rotary_cos_sin = self.embed_positions_for_gpt_attention.value
+            attention_output_orig_quant_scale = self.attention_output_orig_quant_scale.value if self.attention_output_orig_quant_scale is not None else None
+            context, past_key_value = gpt_attention(
+                qkv=qkv,
+                past_key_value=past_key_value,
+                sequence_length=attention_params.sequence_length,
+                host_past_key_value_lengths=kv_cache_params.
+                host_past_key_value_lengths,
+                host_max_attention_window_sizes=kv_cache_params.
+                host_max_attention_window_sizes,
+                host_sink_token_length=kv_cache_params.host_sink_token_length,
+                context_lengths=attention_params.context_lengths,
+                cache_indirection=kv_cache_params.cache_indirection,
+                host_request_types=attention_params.host_request_types,
+                layer_idx=self.local_layer_idx,
+                num_heads=self.num_attention_heads,
+                num_kv_heads=self.num_attention_kv_heads,
+                hidden_size_per_head=self.attention_head_size,
+                q_scaling=self.q_scaling,
+                rotary_embedding_dim=self.rotary_embedding_dim,
+                rotary_embedding_base=self.rotary_embedding_base,
+                rotary_embedding_scale_type=self.rotary_embedding_scale_type,
+                rotary_embedding_scale=self.rotary_embedding_scale,
+                rotary_embedding_max_positions=self.max_position_embeddings,
+                position_embedding_type=self.position_embedding_type,
+                rotary_cos_sin=rotary_cos_sin,
+                kv_orig_quant_scale=kv_orig_quant_scale,
+                kv_quant_orig_scale=kv_quant_orig_scale,
+                attention_output_orig_quant_scale=
+                attention_output_orig_quant_scale,
+                kv_cache_quant_mode=self.quant_mode,
+                max_context_length=attention_params.max_context_length,
+                mask_type=self.attention_mask_type,
+                alibi_slopes=None,
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
+                vision_start=self.vision_start,
+                vision_length=self.vision_length,
+                kv_cache_block_offsets=kv_cache_params.kv_cache_block_offsets,
+                host_kv_cache_block_offsets=kv_cache_params.
+                host_kv_cache_block_offsets,
+                host_kv_cache_pool_pointers=kv_cache_params.
+                host_kv_cache_pool_pointers,
+                do_cross_attention=self.cross_attention,
+                cross_qkv=None,
+                cross_qkv_length=attention_params.encoder_max_input_length,
+                encoder_input_lengths=attention_params.encoder_input_lengths,
+                relative_attention_bias=self.rel_attn_table.value
+                if self.relative_attention else None,
+                max_distance=self.max_distance,
+                host_context_lengths=attention_params.host_context_lengths,
+                use_cache=use_cache,
+                spec_decoding_position_offsets=None,
+                spec_decoding_packed_mask=None,
+            )
+
+        bs = shape(context, 0)
+        seq_length = shape(context, 1)
+        bos = slice(context, [0, 0, 0],
+                    concat([bs, self.vision_start, self.hidden_size]))
+        vis_seq_length = minimum(self.vision_length + 1, seq_length - 1)
+        vision_hidden_states = slice(
+            context, [0, self.vision_start, 0],
+            concat([bs, vis_seq_length, self.hidden_size]))
+        text_seq_length = maximum(
+            0, seq_length - (self.vision_length + 1 + self.vision_start))
+        language_hidden_states = slice(
+            context, [0, self.vision_length + 1 + self.vision_start, 0],
+            concat([bs, text_seq_length, self.hidden_size]))
+
+        bos_dense = self.dense(bos)
+        language_dense = self.dense(language_hidden_states)
+        vision_dense = self.vis_dense(vision_hidden_states)
+        context = concat([bos_dense, vision_dense, language_dense], dim=1)
+
+        if use_cache:
+            return (context, past_key_value)
+        else:
+            return context

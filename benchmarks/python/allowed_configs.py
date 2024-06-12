@@ -12,8 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from dataclasses import asdict, dataclass
-from typing import Dict, Optional, Union
+from dataclasses import asdict, dataclass, field
+from typing import Dict, List, Optional, Union
 
 try:
     from typing import Literal
@@ -60,9 +60,15 @@ class BuildConfig:
     remove_input_padding: bool = None
     parallel_attention: bool = None
     new_decoder_architecture: bool = None
-    mamba_d_state: int = 0
-    mamba_d_conv: int = 0
-    mamba_expand: int = 0
+    state_size: int = 0
+    state_dtype: Optional[str] = None
+    conv_kernel: int = 0
+    layer_types: List[str] = field(default_factory=list)
+    rnn_hidden_size: int = 0
+    logits_soft_cap: float = 0.0
+    opt_batch_size: Optional[int] = None
+    opt_num_tokens: Optional[int] = None
+    use_bias: bool = None
 
 
 @dataclass
@@ -87,6 +93,7 @@ class EncDecBuildConfig:
     builder_opt: Optional[int] = None
     n_mels: Optional[int] = None
     skip_cross_qkv: bool = False
+    use_implicit_relative_attention: Optional[bool] = False
 
     def __post_init__(self) -> None:
         assert self.head_size is not None
@@ -275,6 +282,24 @@ _allowed_configs = {
                     pre_norm=False,
                     do_layer_norm_before=True,
                 )),
+    "opt_30b":
+    ModelConfig(name="opt_30b",
+                family="opt",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=48,
+                    num_heads=56,
+                    hidden_size=7168,
+                    vocab_size=50272,
+                    hidden_act='relu',
+                    n_positions=2048,
+                    max_batch_size=256,
+                    max_input_len=512,
+                    max_output_len=200,
+                    builder_opt=None,
+                    pre_norm=False,
+                    do_layer_norm_before=True,
+                )),
     "opt_66b":
     ModelConfig(name="opt_66b",
                 family="opt",
@@ -293,7 +318,7 @@ _allowed_configs = {
                     pre_norm=True,
                     do_layer_norm_before=True,
                 )),
-    "starcoder":
+    "starcoder_15.5b":
     ModelConfig(name="starcoder_15.5b",
                 family="gpt",
                 benchmark_type="gpt",
@@ -456,6 +481,7 @@ _allowed_configs = {
                 build_config=BuildConfig(
                     num_layers=32,
                     num_heads=32,
+                    num_kv_heads=8,
                     hidden_size=4096,
                     vocab_size=32000,
                     hidden_act='swiglu',
@@ -480,7 +506,7 @@ _allowed_configs = {
                     hidden_act='gelu',
                     n_positions=1024,
                     rotary_dim=64,
-                    max_batch_size=256,
+                    max_batch_size=128,
                     max_input_len=512,
                     max_output_len=200,
                     builder_opt=None,
@@ -559,6 +585,25 @@ _allowed_configs = {
                     builder_opt=None,
                     remove_input_padding=False,
                 )),
+    "glm_10b":
+    ModelConfig(name="glm_10b",
+                family="glm",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=48,
+                    num_heads=64,
+                    num_kv_heads=64,
+                    hidden_size=4096,
+                    inter_size=16384,
+                    vocab_size=50304,
+                    hidden_act='gelu',
+                    n_positions=1024,
+                    max_batch_size=128,
+                    max_input_len=1024,
+                    max_output_len=256,
+                    builder_opt=None,
+                    remove_input_padding=False,
+                )),
     "bloom_560m":
     ModelConfig(name="bloom_560m",
                 family="bloom",
@@ -570,7 +615,7 @@ _allowed_configs = {
                     vocab_size=250880,
                     hidden_act=None,
                     n_positions=2048,
-                    max_batch_size=8,
+                    max_batch_size=32,
                     max_input_len=1024,
                     max_output_len=1024,
                     builder_opt=None,
@@ -1174,9 +1219,11 @@ _allowed_configs = {
                     max_batch_size=64,
                     max_input_len=1024,
                     max_output_len=1024,
-                    mamba_d_state=16,
-                    mamba_d_conv=4,
-                    mamba_expand=2,
+                    state_size=16,
+                    conv_kernel=4,
+                    rnn_hidden_size=5120,
+                    layer_types=["recurrent"],
+                    use_bias=False,
                 )),
     "mamba_1.4b":
     ModelConfig(name="mamba_1.4b",
@@ -1192,9 +1239,11 @@ _allowed_configs = {
                     max_batch_size=64,
                     max_input_len=1024,
                     max_output_len=1024,
-                    mamba_d_state=16,
-                    mamba_d_conv=4,
-                    mamba_expand=2,
+                    state_size=16,
+                    conv_kernel=4,
+                    rnn_hidden_size=4096,
+                    layer_types=["recurrent"],
+                    use_bias=False,
                 )),
     "mamba_790m":
     ModelConfig(name="mamba_790m",
@@ -1210,9 +1259,11 @@ _allowed_configs = {
                     max_batch_size=64,
                     max_input_len=1024,
                     max_output_len=1024,
-                    mamba_d_state=16,
-                    mamba_d_conv=4,
-                    mamba_expand=2,
+                    state_size=16,
+                    conv_kernel=4,
+                    rnn_hidden_size=3072,
+                    layer_types=["recurrent"],
+                    use_bias=False,
                 )),
     "mamba_370m":
     ModelConfig(name="mamba_370m",
@@ -1228,9 +1279,11 @@ _allowed_configs = {
                     max_batch_size=64,
                     max_input_len=1024,
                     max_output_len=1024,
-                    mamba_d_state=16,
-                    mamba_d_conv=4,
-                    mamba_expand=2,
+                    state_size=16,
+                    conv_kernel=4,
+                    rnn_hidden_size=2048,
+                    layer_types=["recurrent"],
+                    use_bias=False,
                 )),
     "mamba_130m":
     ModelConfig(name="mamba_130m",
@@ -1246,9 +1299,11 @@ _allowed_configs = {
                     max_batch_size=64,
                     max_input_len=1024,
                     max_output_len=1024,
-                    mamba_d_state=16,
-                    mamba_d_conv=4,
-                    mamba_expand=2,
+                    state_size=16,
+                    conv_kernel=4,
+                    rnn_hidden_size=1536,
+                    layer_types=["recurrent"],
+                    use_bias=False,
                 )),
     "whisper_large_v3":
     ModelConfig(name="whisper_large_v3",
@@ -1270,6 +1325,31 @@ _allowed_configs = {
                     max_decoder_input_len=1,
                     max_output_len=200,
                     builder_opt=None,
+                )),
+    "recurrentgemma_2b":
+    ModelConfig(name="recurrentgemma_2b",
+                family="recurrentgemma",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=26,
+                    num_heads=10,
+                    num_kv_heads=1,
+                    hidden_size=2560,
+                    inter_size=7680,
+                    vocab_size=256000,
+                    hidden_act="gelu",
+                    n_positions=8192,
+                    max_batch_size=64,
+                    max_input_len=1024,
+                    max_output_len=1024,
+                    position_embedding_type='rope_gpt_neox',
+                    rotary_pct=0.5,
+                    conv_kernel=4,
+                    state_size=1,
+                    layer_types=["recurrent", "recurrent", "attention"],
+                    rnn_hidden_size=2560,
+                    logits_soft_cap=30.0,
+                    state_dtype="float32",
                 )),
 }
 

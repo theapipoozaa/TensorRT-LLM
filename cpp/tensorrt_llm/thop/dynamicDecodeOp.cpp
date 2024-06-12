@@ -17,12 +17,14 @@
 #include "tensorrt_llm/thop/dynamicDecodeOp.h"
 
 #include "tensorrt_llm/common/tensorConversion.h"
+#include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include "tensorrt_llm/thop/torchAllocator.h"
 
 namespace th = torch;
 
+namespace tle = tensorrt_llm::executor;
 namespace tr = tensorrt_llm::runtime;
 namespace tcc = tensorrt_llm::common::conversion;
 
@@ -42,13 +44,11 @@ FtDynamicDecode<T>::FtDynamicDecode(size_t const max_batch_size, size_t const ma
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     auto allocator = std::make_shared<tensorrt_llm::thop::TorchAllocator>(stream);
 
-    int deviceId;
-    cudaDeviceProp prop;
-    tensorrt_llm::common::check_cuda_error(cudaGetDevice(&deviceId));
-    tensorrt_llm::common::check_cuda_error(cudaGetDeviceProperties(&prop, deviceId));
+    auto const decodingDomain
+        = tensorrt_llm::layers::DecoderDomain(max_batch_size, max_beam_width, vocab_size, vocab_size_padded);
 
-    dynamic_decode_layer_ = std::make_shared<tensorrt_llm::layers::DynamicDecodeLayer<T>>(tr::DecodingMode::None(),
-        max_batch_size, max_beam_width, vocab_size, vocab_size_padded, stream, std::move(allocator), &prop);
+    dynamic_decode_layer_ = std::make_shared<tensorrt_llm::layers::DynamicDecodeLayer<T>>(
+        tle::DecodingMode::Auto(), decodingDomain, stream, std::move(allocator));
 }
 
 namespace
@@ -106,26 +106,30 @@ void FtDynamicDecode<T>::setup(size_t const batch_size, size_t const beam_width,
     th::optional<th::Tensor> min_length_opt, th::optional<th::Tensor> length_penalty_opt,
     th::optional<th::Tensor> early_stopping_opt, th::optional<th::Tensor> beam_search_diversity_rate_opt,
     th::optional<th::Tensor> random_seed_opt, th::optional<th::Tensor> top_p_decay_opt,
-    th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt)
+    th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt,
+    th::optional<th::Tensor> no_repeat_ngram_size_opt, bool output_log_probs, bool cum_log_probs)
 {
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     dynamic_decode_layer_->setStream(stream);
 
-    SetupParams setupParams;
-    safeInsert(temperature_opt, setupParams.temperature);
-    safeInsert(repetition_penalty_opt, setupParams.repetition_penalty);
-    safeInsert(presence_penalty_opt, setupParams.presence_penalty);
-    safeInsert(frequency_penalty_opt, setupParams.frequency_penalty);
-    safeInsert(min_length_opt, setupParams.min_length);
-    safeInsert(runtime_top_k_opt, setupParams.runtime_top_k);
-    safeInsert(runtime_top_p_opt, setupParams.runtime_top_p);
-    safeInsert(random_seed_opt, setupParams.randomSeed);
-    safeInsert(top_p_decay_opt, setupParams.top_p_decay);
-    safeInsert(top_p_min_opt, setupParams.top_p_min);
-    safeInsert(top_p_reset_ids_opt, setupParams.top_p_reset_ids);
-    safeInsert(beam_search_diversity_rate_opt, setupParams.beam_search_diversity_rate);
-    safeInsert(length_penalty_opt, setupParams.length_penalty);
-    safeInsert(early_stopping_opt, setupParams.early_stopping);
+    auto setupParams = std::make_shared<tensorrt_llm::layers::DynamicDecodeSetupParams>();
+    safeInsert(temperature_opt, setupParams->penaltyParams.temperature);
+    safeInsert(repetition_penalty_opt, setupParams->penaltyParams.repetitionPenalty);
+    safeInsert(presence_penalty_opt, setupParams->penaltyParams.presencePenalty);
+    safeInsert(frequency_penalty_opt, setupParams->penaltyParams.frequencyPenalty);
+    safeInsert(min_length_opt, setupParams->penaltyParams.minLength);
+    safeInsert(no_repeat_ngram_size_opt, setupParams->penaltyParams.noRepeatNgramSize);
+    safeInsert(runtime_top_k_opt, setupParams->samplingParams.runtime_top_k);
+    safeInsert(runtime_top_p_opt, setupParams->samplingParams.runtime_top_p);
+    safeInsert(random_seed_opt, setupParams->randomSeed);
+    safeInsert(top_p_decay_opt, setupParams->samplingParams.top_p_decay);
+    safeInsert(top_p_min_opt, setupParams->samplingParams.top_p_min);
+    safeInsert(top_p_reset_ids_opt, setupParams->samplingParams.top_p_reset_ids);
+    safeInsert(beam_search_diversity_rate_opt, setupParams->beamSearchParams.beam_search_diversity_rate);
+    safeInsert(length_penalty_opt, setupParams->beamSearchParams.length_penalty);
+    safeInsert(early_stopping_opt, setupParams->beamSearchParams.early_stopping);
+    setupParams->samplingParams.outputLogProbs = std::vector<bool>({output_log_probs});
+    setupParams->samplingParams.cumLogProbs = std::vector<bool>({cum_log_probs});
     // TODO: insert "normalize_log_probs" and "topKMedusaHeads"
 
     dynamic_decode_layer_->setup(batch_size, beam_width, nullptr, setupParams);
@@ -138,52 +142,50 @@ void FtDynamicDecode<T>::forward(th::Tensor const& logits, int const step, int c
     th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_ptrs_opt,
     th::optional<th::Tensor> stop_words_lens_opt, int32_t const max_stop_words_len,
     th::optional<th::Tensor> bad_words_list_ptrs_opt, th::optional<th::Tensor> bad_words_lens_opt,
-    int32_t const max_bad_words_len, th::optional<th::Tensor> no_repeat_ngram_size_opt,
-    th::optional<th::Tensor> src_cache_indirection_opt, th::Tensor& output_token_ids, th::Tensor& newTokens,
-    th::Tensor& should_stop, th::optional<th::Tensor> finished_input, th::optional<th::Tensor> finished_output,
-    th::optional<th::Tensor> sequence_lengths_opt, th::optional<th::Tensor> cum_log_probs_opt,
-    th::optional<th::Tensor> output_log_probs_opt, th::optional<th::Tensor> output_log_probs_tiled_opt,
-    th::optional<th::Tensor> parent_ids_opt, th::optional<th::Tensor> tgt_cache_indirection_opt,
-    th::optional<th::Tensor> beam_hyps_output_ids_cba_opt, th::optional<th::Tensor> beam_hyps_seq_len_cba_opt,
-    th::optional<th::Tensor> beam_hyps_cum_log_probs_cba_opt, th::optional<th::Tensor> beam_hyps_normed_scores_cba_opt,
-    th::optional<th::Tensor> beam_hyps_log_probs_cba_opt, th::optional<th::Tensor> beam_hyps_min_normed_scores_opt,
-    th::optional<th::Tensor> beam_hyps_num_beams_opt, th::optional<th::Tensor> beam_hyps_is_done_opt,
-    bool const use_beam_hyps)
+    int32_t const max_bad_words_len, th::optional<th::Tensor> src_cache_indirection_opt, th::Tensor& output_token_ids,
+    th::Tensor& newTokens, th::Tensor& should_stop, th::optional<th::Tensor> finished_input,
+    th::optional<th::Tensor> finished_output, th::optional<th::Tensor> sequence_lengths_opt,
+    th::optional<th::Tensor> cum_log_probs_opt, th::optional<th::Tensor> output_log_probs_opt,
+    th::optional<th::Tensor> output_log_probs_tiled_opt, th::optional<th::Tensor> parent_ids_opt,
+    th::optional<th::Tensor> tgt_cache_indirection_opt, th::optional<th::Tensor> beam_hyps_output_ids_cba_opt,
+    th::optional<th::Tensor> beam_hyps_seq_len_cba_opt, th::optional<th::Tensor> beam_hyps_cum_log_probs_cba_opt,
+    th::optional<th::Tensor> beam_hyps_normed_scores_cba_opt, th::optional<th::Tensor> beam_hyps_log_probs_cba_opt,
+    th::optional<th::Tensor> beam_hyps_min_normed_scores_opt, th::optional<th::Tensor> beam_hyps_num_beams_opt,
+    th::optional<th::Tensor> beam_hyps_is_done_opt, bool const use_beam_hyps)
 {
-    typename tensorrt_llm::layers::DynamicDecodeLayer<T>::ForwardParams forwardParams{step, static_cast<int>(ite),
-        max_input_length, max_attention_window, sink_token_length, local_batch_size, convert_tensor<int>(end_id)};
+    auto forwardParams = std::make_shared<tensorrt_llm::layers::DynamicDecodeInputParams>(step, static_cast<int>(ite),
+        max_input_length, max_attention_window, sink_token_length, local_batch_size, convert_tensor<int>(end_id));
 
-    forwardParams.logits = convert_tensor<float>(logits);
+    forwardParams->logits = convert_tensor<float>(logits);
 
-    safeUpdate<T>(embedding_bias_opt, forwardParams.embedding_bias);
-    safeUpdate<int>(input_lengths_opt, forwardParams.input_lengths);
-    safeUpdate<int>(sequence_limit_length_opt, forwardParams.sequence_limit_length);
-    safeUpdate<uint64_t>(stop_words_list_ptrs_opt, forwardParams.stop_words_ptr);
-    safeUpdate<int>(stop_words_lens_opt, forwardParams.stop_words_lengths);
-    forwardParams.max_stop_words_len = max_stop_words_len;
-    safeUpdate<uint64_t>(bad_words_list_ptrs_opt, forwardParams.bad_words_ptr);
-    safeUpdate<int>(bad_words_lens_opt, forwardParams.bad_words_lengths);
-    forwardParams.max_bad_words_len = max_bad_words_len;
-    safeUpdate<int>(no_repeat_ngram_size_opt, forwardParams.no_repeat_ngram_size);
-    safeUpdate<int>(src_cache_indirection_opt, forwardParams.src_cache_indirection);
+    safeUpdate<T>(embedding_bias_opt, forwardParams->embedding_bias);
+    safeUpdate<int>(input_lengths_opt, forwardParams->input_lengths);
+    safeUpdate<int>(sequence_limit_length_opt, forwardParams->sequence_limit_length);
+    safeUpdate<uint64_t>(stop_words_list_ptrs_opt, forwardParams->stop_words_ptr);
+    safeUpdate<int>(stop_words_lens_opt, forwardParams->stop_words_lengths);
+    forwardParams->max_stop_words_len = max_stop_words_len;
+    safeUpdate<uint64_t>(bad_words_list_ptrs_opt, forwardParams->bad_words_ptr);
+    safeUpdate<int>(bad_words_lens_opt, forwardParams->bad_words_lengths);
+    forwardParams->max_bad_words_len = max_bad_words_len;
+    safeUpdate<int>(src_cache_indirection_opt, forwardParams->src_cache_indirection);
 
     auto const& output_ids_converted = convert_tensor<int>(output_token_ids);
-    typename tensorrt_llm::layers::DynamicDecodeLayer<T>::OutputParams outputParams{output_ids_converted};
-    outputParams.newTokens = std::move(convert_tensor<int>(newTokens));
-    safeUpdate<uint8_t>(finished_input, forwardParams.finished);
-    safeUpdate<uint8_t>(finished_output, outputParams.finished);
-    safeUpdate<int>(sequence_lengths_opt, outputParams.sequence_length);
-    safeUpdate<float>(cum_log_probs_opt, outputParams.cum_log_probs);
-    safeUpdate<float>(output_log_probs_opt, outputParams.output_log_probs);
-    safeUpdate<float>(output_log_probs_tiled_opt, outputParams.output_log_probs_tiled);
-    safeUpdate<int>(parent_ids_opt, outputParams.parent_ids);
-    safeUpdate<int>(tgt_cache_indirection_opt, outputParams.tgt_cache_indirection);
+    auto outputParams = std::make_shared<tensorrt_llm::layers::DynamicDecodeOutputParams>(output_ids_converted);
+    outputParams->newTokens = std::move(convert_tensor<int>(newTokens));
+    safeUpdate<uint8_t>(finished_input, forwardParams->finished);
+    safeUpdate<uint8_t>(finished_output, outputParams->finished);
+    safeUpdate<int>(sequence_lengths_opt, outputParams->sequence_length);
+    safeUpdate<float>(cum_log_probs_opt, outputParams->cum_log_probs);
+    safeUpdate<float>(output_log_probs_opt, outputParams->output_log_probs);
+    safeUpdate<float>(output_log_probs_tiled_opt, outputParams->output_log_probs_tiled);
+    safeUpdate<int>(parent_ids_opt, outputParams->parent_ids);
+    safeUpdate<int>(tgt_cache_indirection_opt, outputParams->tgt_cache_indirection);
 
     std::int32_t* finished_sum_host = nullptr;
-    if (forwardParams.sequence_limit_length && outputParams.finished.has_value())
+    if (forwardParams->sequence_limit_length && outputParams->finished.has_value())
     {
         // Skip the initialization and later calculation if there is no limit of sequence length or no finished beam
-        outputParams.finished_sum = tcc::toTllmTensor(*finished_sum_);
+        outputParams->finished_sum = tcc::toTllmTensor(*finished_sum_);
         finished_sum_host = tr::bufferCast<std::int32_t>(*finished_sum_);
         for (int32_t bi = 0; bi < local_batch_size; ++bi)
         {
@@ -194,20 +196,18 @@ void FtDynamicDecode<T>::forward(th::Tensor const& logits, int const step, int c
     if (use_beam_hyps)
     {
         // Additional parameters for beam search
-        outputParams.beamHypotheses = std::make_shared<tensorrt_llm::kernels::BeamHypotheses>();
-        safeUpdatePtr<bool>(beam_hyps_is_done_opt, outputParams.beamHypotheses->batchDones);
-        safeUpdatePtr<float>(beam_hyps_cum_log_probs_cba_opt, outputParams.beamHypotheses->cumLogProbsCBA);
-        safeUpdatePtr<float>(beam_hyps_log_probs_cba_opt, outputParams.beamHypotheses->logProbsCBA);
-        safeUpdatePtr<float>(beam_hyps_min_normed_scores_opt, outputParams.beamHypotheses->minNormedScoresCBA);
-        safeUpdatePtr<float>(beam_hyps_normed_scores_cba_opt, outputParams.beamHypotheses->normedScoresCBA);
-        safeUpdatePtr<int>(beam_hyps_num_beams_opt, outputParams.beamHypotheses->numBeamsCBA);
-        safeUpdatePtr<int>(beam_hyps_output_ids_cba_opt, outputParams.beamHypotheses->outputIdsCBA);
-        safeUpdatePtr<int>(beam_hyps_seq_len_cba_opt, outputParams.beamHypotheses->sequenceLengthsCBA);
-        // TODO: move the assignment below into beamSearchLayer.cu
-        safeUpdatePtr<int32_t const>(input_lengths_opt, outputParams.beamHypotheses->inputLengths);
+        outputParams->beamHypotheses = std::make_unique<tensorrt_llm::kernels::BeamHypotheses>();
+        safeUpdatePtr<bool>(beam_hyps_is_done_opt, outputParams->beamHypotheses->batchDones);
+        safeUpdatePtr<float>(beam_hyps_cum_log_probs_cba_opt, outputParams->beamHypotheses->cumLogProbsCBA);
+        safeUpdatePtr<float>(beam_hyps_log_probs_cba_opt, outputParams->beamHypotheses->logProbsCBA);
+        safeUpdatePtr<float>(beam_hyps_min_normed_scores_opt, outputParams->beamHypotheses->minNormedScoresCBA);
+        safeUpdatePtr<float>(beam_hyps_normed_scores_cba_opt, outputParams->beamHypotheses->normedScoresCBA);
+        safeUpdatePtr<int>(beam_hyps_num_beams_opt, outputParams->beamHypotheses->numBeamsCBA);
+        safeUpdatePtr<int>(beam_hyps_output_ids_cba_opt, outputParams->beamHypotheses->outputIdsCBA);
+        safeUpdatePtr<int>(beam_hyps_seq_len_cba_opt, outputParams->beamHypotheses->sequenceLengthsCBA);
     }
 
-    dynamic_decode_layer_->forward(outputParams, forwardParams);
+    dynamic_decode_layer_->forwardAsync(outputParams, forwardParams);
 
     if (finished_sum_host)
     {
@@ -217,7 +217,7 @@ void FtDynamicDecode<T>::forward(th::Tensor const& logits, int const step, int c
         {
             numRealFinished += finished_sum_host[bi];
         }
-        auto const numToFinish = outputParams.finished->size();
+        auto const numToFinish = outputParams->finished->size();
         auto should_stop_accessor = should_stop.accessor<bool, 1>();
         should_stop_accessor[0] = numToFinish == numRealFinished;
     }
@@ -262,7 +262,8 @@ void DynamicDecodeOp::setup(int64_t const batch_size, int64_t const beam_width,
     th::optional<th::Tensor> min_length_opt, th::optional<th::Tensor> length_penalty_opt,
     th::optional<th::Tensor> early_stopping_opt, th::optional<th::Tensor> beam_search_diversity_rate_opt,
     th::optional<th::Tensor> random_seed_opt, th::optional<th::Tensor> top_p_decay_opt,
-    th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt)
+    th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt,
+    th::optional<th::Tensor> no_repeat_ngram_size_opt, bool output_log_probs, bool cum_log_probs)
 {
     // TODO: Revise DynamicDecodeLayer and make the decode arguments consistent.
     // TODO: add parameters "normalize_log_probs" and "topKMedusaHeads"
@@ -275,6 +276,7 @@ void DynamicDecodeOp::setup(int64_t const batch_size, int64_t const beam_width,
     CHECK_OPTIONAL_CPU_INPUT(min_length_opt, torch::kInt32);
     CHECK_OPTIONAL_CPU_INPUT(length_penalty_opt, torch::kFloat);
     CHECK_OPTIONAL_CPU_INPUT(early_stopping_opt, torch::kInt32);
+    CHECK_OPTIONAL_CPU_INPUT(no_repeat_ngram_size_opt, torch::kInt32);
     CHECK_OPTIONAL_CPU_INPUT(beam_search_diversity_rate_opt, torch::kFloat);
     CHECK_OPTIONAL_CPU_INPUT(random_seed_opt, torch::kInt64);
     CHECK_OPTIONAL_INPUT(top_p_decay_opt, torch::kFloat);
@@ -284,7 +286,7 @@ void DynamicDecodeOp::setup(int64_t const batch_size, int64_t const beam_width,
     dynamic_decode_->setup(static_cast<size_t>(batch_size), static_cast<size_t>(beam_width), runtime_top_k_opt,
         runtime_top_p_opt, temperature_opt, repetition_penalty_opt, presence_penalty_opt, frequency_penalty_opt,
         min_length_opt, length_penalty_opt, early_stopping_opt, beam_search_diversity_rate_opt, random_seed_opt,
-        top_p_decay_opt, top_p_min_opt, top_p_reset_ids_opt);
+        top_p_decay_opt, top_p_min_opt, top_p_reset_ids_opt, no_repeat_ngram_size_opt, output_log_probs, cum_log_probs);
 }
 
 th::Tensor DynamicDecodeOp::forward(
@@ -306,7 +308,6 @@ th::Tensor DynamicDecodeOp::forward(
     th::optional<th::Tensor> bad_words_list_ptrs_opt,   // [BS][2, bad_words_length], int64
     th::optional<th::Tensor> bad_words_lens_opt,        // [BS], int
     int64_t const max_bad_words_len,                    //
-    th::optional<th::Tensor> no_repeat_ngram_size_opt,  // [BS], int
     th::optional<th::Tensor> src_cache_indirection_opt, // [local_BS, BM, MSL], int
     // Outputs
     th::Tensor output_token_ids,                              // [BS, BM, MSL], variables for output
@@ -345,7 +346,6 @@ th::Tensor DynamicDecodeOp::forward(
     CHECK_OPTIONAL_INPUT(stop_words_lens_opt, torch::kInt32);
     CHECK_OPTIONAL_INPUT(bad_words_list_ptrs_opt, torch::kInt64);
     CHECK_OPTIONAL_INPUT(bad_words_lens_opt, torch::kInt32);
-    CHECK_OPTIONAL_INPUT(no_repeat_ngram_size_opt, torch::kInt32);
     CHECK_OPTIONAL_INPUT(src_cache_indirection_opt, torch::kInt32);
     CHECK_INPUT(output_token_ids, torch::kInt32);
     CHECK_INPUT(newTokens, torch::kInt32);
@@ -366,7 +366,7 @@ th::Tensor DynamicDecodeOp::forward(
         static_cast<int>(sink_token_length), static_cast<uint32_t>(ite), static_cast<int>(local_batch_size), end_id,
         embedding_bias_opt, input_lengths_opt, sequence_limit_length_opt, stop_words_list_ptrs_opt, stop_words_lens_opt,
         static_cast<int32_t>(max_stop_words_len), bad_words_list_ptrs_opt, bad_words_lens_opt,
-        static_cast<int32_t>(max_bad_words_len), no_repeat_ngram_size_opt, src_cache_indirection_opt,
+        static_cast<int32_t>(max_bad_words_len), src_cache_indirection_opt,
         // Outputs
         output_token_ids, newTokens, should_stop, finished_input, finished_output, sequence_lengths_opt,
         cum_log_probs_opt, output_log_probs_opt, output_log_probs_tiled_opt, parent_ids_opt, tgt_cache_indirection_opt,

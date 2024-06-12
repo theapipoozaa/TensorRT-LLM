@@ -26,6 +26,9 @@ if(${CMAKE_BUILD_TYPE} MATCHES "Debug")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g")
 endif()
 
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --Wno-deprecated-declarations")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --diag-suppress 997")
+
 set(PLUGIN_SOURCES)
 set(PLUGIN_CU_SOURCES)
 
@@ -35,6 +38,7 @@ set(PLUGIN_LISTS
     gptAttentionPlugin
     identityPlugin
     gemmPlugin
+    gemmSwigluPlugin
     smoothQuantGemmPlugin
     quantizePerTokenPlugin
     quantizeTensorPlugin
@@ -46,7 +50,9 @@ set(PLUGIN_LISTS
     loraPlugin
     mixtureOfExperts
     selectiveScanPlugin
-    mambaConv1dPlugin)
+    mambaConv1dPlugin
+    lruPlugin
+    cumsumLastDimPlugin)
 
 foreach(PLUGIN_ITER ${PLUGIN_LISTS})
   include_directories(${PLUGIN_ITER})
@@ -76,8 +82,13 @@ add_library(${PLUGIN_SHARED_TARGET} SHARED ${PLUGIN_SOURCES})
 
 target_include_directories(
   ${PLUGIN_SHARED_TARGET}
-  PUBLIC ${CUDA_INSTALL_DIR}/include ${MPI_C_INCLUDE_DIRS}
+  PUBLIC ${CUDA_INSTALL_DIR}/include
   PRIVATE ${TARGET_DIR})
+
+if(ENABLE_MULTI_DEVICE EQUAL 1)
+  target_include_directories(${PLUGIN_SHARED_TARGET}
+                             PUBLIC ${MPI_C_INCLUDE_DIRS})
+endif()
 
 if(CUDA_VERSION VERSION_LESS 11.0)
   target_include_directories(${PLUGIN_SHARED_TARGET} PUBLIC ${CUB_ROOT_DIR})
@@ -117,8 +128,11 @@ target_link_libraries(
   ${CUBLASLT_LIB}
   nvinfer
   ${CUDA_DRV_LIB}
+  ${CUDA_NVML_LIB}
   ${CUDA_RT_LIB}
   ${CMAKE_DL_LIBS}
-  ${MPI_C_LIBRARIES}
-  ${NCCL_LIB}
   ${SHARED_TARGET})
+
+if(ENABLE_MULTI_DEVICE EQUAL 1)
+  target_link_libraries(${PLUGIN_SHARED_TARGET} ${MPI_C_LIBRARIES} ${NCCL_LIB})
+endif()

@@ -17,6 +17,7 @@
 #include "gptAttentionCommon.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
@@ -24,6 +25,7 @@
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include "tensorrt_llm/plugins/common/checkMacrosPlugin.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
+#include "tensorrt_llm/runtime/utils/debugUtils.h"
 #include <NvInferRuntimePlugin.h>
 #include <algorithm>
 #include <cstdint>
@@ -67,7 +69,13 @@ struct FusedQKVMaskedAttentionDispatchParams
     float rotary_embedding_base;
     RotaryScalingType rotary_embedding_scale_type;
     float rotary_embedding_scale;
+    float rotary_embedding_short_m_scale;
+    float rotary_embedding_long_m_scale;
+    float const* rotary_embedding_scaling_factors;
     int rotary_embedding_max_positions;
+    int rotary_embedding_original_max_positions;
+    int rotary_cogvlm_vision_start;
+    int rotary_cogvlm_vision_length;
     PositionEmbeddingType position_embedding_type;
     bool position_shift_enabled;
     int max_attention_window;
@@ -76,6 +84,7 @@ struct FusedQKVMaskedAttentionDispatchParams
     int const* input_lengths;
     int step;
     float q_scaling;
+    float qk_tanh_scale;
     int relative_attention_bias_stride;
     T const* linear_bias_slopes;
     int const* ia3_tasks;
@@ -102,6 +111,8 @@ struct FusedQKVMaskedAttentionDispatchParams
     bool cross_attention = false;
     int const* memory_length_per_sample = nullptr;
     int max_distance = 0;
+    bool block_sparse_attention = false;
+    BlockSparseParams block_sparse_params;
 };
 
 template <typename T, typename KVCacheBuffer>
@@ -164,6 +175,8 @@ bool GPTAttentionPluginCommon::convertMMHAParamsToXQAParams(tensorrt_llm::kernel
     xqaParams.rotary_embedding_scale_type = mRotaryEmbeddingScaleType;
     xqaParams.rotary_embedding_scale = mRotaryEmbeddingScale;
     xqaParams.rotary_embedding_max_positions = mRotaryEmbeddingMaxPositions;
+    xqaParams.rotary_vision_start = mVisionStart;
+    xqaParams.rotary_vision_length = mVisionLength;
     xqaParams.position_embedding_type = mPositionEmbeddingType;
     xqaParams.position_shift_enabled = mPosShiftEnabled;
     xqaParams.remove_padding = mRemovePadding;
@@ -178,7 +191,7 @@ bool GPTAttentionPluginCommon::convertMMHAParamsToXQAParams(tensorrt_llm::kernel
     xqaParams.max_distance = mMaxDistance;
     xqaParams.multi_block_mode = mMultiBlockMode;
     // Medusa mode will have multiple query tokens.
-    xqaParams.multi_query_tokens = mIsMedusaEnabled;
+    xqaParams.multi_query_tokens = mIsSpecDecodingEnabled;
 
     if (mKVCacheQuantMode.hasInt8KvCache())
     {
@@ -205,10 +218,11 @@ bool GPTAttentionPluginCommon::convertMMHAParamsToXQAParams(tensorrt_llm::kernel
     xqaParams.kv_scale_quant_orig = generationsParams.kv_scale_quant_orig;
     xqaParams.host_past_key_value_lengths = generationsParams.host_past_key_value_lengths;
     xqaParams.host_context_lengths = generationsParams.host_context_lengths;
+    xqaParams.semaphores = generationsParams.semaphores;
     xqaParams.workspaces = generationsParams.workspace;
     xqaParams.batch_size = generationsParams.num_requests;
     xqaParams.beam_width = generationsParams.beam_width;
-    // Medusa mode has generation input_length > 1.
+    // Speculative decoding mode has generation input_length > 1.
     xqaParams.generation_input_length = generationsParams.input_seq_length;
     xqaParams.max_attention_window_size = generationsParams.max_attention_window;
     xqaParams.cyclic_attention_window_size = generationsParams.cyclic_attention_window_size;
@@ -221,12 +235,16 @@ bool GPTAttentionPluginCommon::convertMMHAParamsToXQAParams(tensorrt_llm::kernel
     xqaParams.alibi_slopes = generationsParams.alibi_slopes;
     if (!forConfigurePlugin)
     {
-        // Medusa (need to take new generated ids into consideration).
-        TLLM_CHECK_WITH_INFO(!mIsMedusaEnabled || generationsParams.medusa_packed_mask != nullptr,
-            "Medusa mode needs a valid packed_mask input tensor.");
+        // Speculative decoding (need to take new generated ids into consideration).
+        TLLM_CHECK_WITH_INFO(!mIsSpecDecodingEnabled || generationsParams.spec_decoding_packed_mask != nullptr,
+            "Speculative decoding mode needs a valid packed_mask input tensor.");
     }
-    xqaParams.medusa_packed_mask = generationsParams.medusa_packed_mask;
-    xqaParams.medusa_position_offsets = generationsParams.medusa_position_offsets;
+    xqaParams.spec_decoding_packed_mask = generationsParams.spec_decoding_packed_mask;
+    xqaParams.spec_decoding_position_offsets = generationsParams.spec_decoding_position_offsets;
+    xqaParams.spec_decoding_generation_lengths = generationsParams.spec_decoding_generation_lengths;
+
+    xqaParams.total_num_input_tokens = generationsParams.total_num_input_tokens;
+    xqaParams.fp8_out_scale = (mFP8ContextFMHA ? generationsParams.attention_output_orig_quant : nullptr);
     return true;
 }
 
@@ -289,15 +307,25 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
     params.rotary_embedding_base = input_params.rotary_embedding_base;
     params.rotary_embedding_scale_type = input_params.rotary_embedding_scale_type;
     params.rotary_embedding_scale = input_params.rotary_embedding_scale;
+    params.rotary_embedding_short_m_scale = input_params.rotary_embedding_short_m_scale;
+    params.rotary_embedding_long_m_scale = input_params.rotary_embedding_long_m_scale;
+    params.rotary_embedding_scaling_factors = input_params.rotary_embedding_scaling_factors;
     params.rotary_embedding_max_positions = input_params.rotary_embedding_max_positions;
+    params.rotary_embedding_original_max_positions = input_params.rotary_embedding_original_max_positions;
+    params.rotary_cogvlm_vision_start = input_params.rotary_cogvlm_vision_start;
+    params.rotary_cogvlm_vision_length = input_params.rotary_cogvlm_vision_length;
     params.position_embedding_type = input_params.position_embedding_type;
     params.position_shift_enabled = input_params.position_shift_enabled;
     // Note: keep norm factor (sqrt(K_dim)) when adopting megatron T5 structure (may adjust)
     params.inv_sqrt_dh = 1.F / (sqrtf((float) params.hidden_size_per_head) * input_params.q_scaling);
+    params.qk_tanh_scale = input_params.qk_tanh_scale;
+    params.qk_tanh_inverse_scale = 1.0f / input_params.qk_tanh_scale;
 
     params.relative_attention_bias = reinterpret_cast<DataType const*>(input_params.relative_attention_bias);
     params.relative_attention_bias_stride = input_params.relative_attention_bias_stride;
     params.max_distance = input_params.max_distance;
+    params.block_sparse_attention = input_params.block_sparse_attention;
+    params.block_sparse_params = input_params.block_sparse_params;
 
     // The slope of linear position bias per head, e.g., ALiBi.
     if (input_params.linear_bias_slopes != nullptr)
@@ -357,33 +385,44 @@ INSTANTIATE_MMHA_DISPATCH(__nv_bfloat16, __nv_bfloat16)
 #endif
 #undef INSTANTIATE_MMHA_DISPATCH
 
-GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads, int num_kv_heads, int head_size,
-    int unidirectional, float q_scaling, tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
+GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads, int vision_start, int vision_length,
+    int num_kv_heads, int head_size, int unidirectional, float q_scaling, float qk_tanh_scale,
+    tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
     int rotary_embedding_dim, // for RoPE. Use 0 for non-RoPE
     float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
-    float rotary_embedding_scale, int rotary_embedding_max_positions, int tp_size, int tp_rank, // for ALiBi
-    bool unfuse_qkv_gemm,                                                                       // for AutoPP
+    float rotary_embedding_scale, float rotary_embedding_short_m_scale, float rotary_embedding_long_m_scale,
+    int rotary_embedding_max_positions, int rotary_embedding_original_max_positions, int tp_size,
+    int tp_rank,          // for ALiBi
+    bool unfuse_qkv_gemm, // for AutoPP
     tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, bool enable_xqa,
     int kv_cache_quant_mode, bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type,
-    bool paged_kv_cache, int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length,
-    bool qkv_bias_enabled, bool cross_attention, int max_distance, bool pos_shift_enabled, bool dense_context_fmha,
-    bool use_paged_context_fmha, bool use_fp8_context_fmha, bool use_cache, bool is_medusa_enabled)
+    tensorrt_llm::kernels::BlockSparseParams block_sparse_params, bool paged_kv_cache, int tokens_per_block,
+    nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled, bool cross_attention, int max_distance,
+    bool pos_shift_enabled, bool dense_context_fmha, bool use_paged_context_fmha, bool use_fp8_context_fmha,
+    bool use_cache, bool is_spec_decoding_enabled)
     : mLayerIdx(layer_idx)
     , mNumHeads(num_heads)
+    , mVisionStart(vision_start)
+    , mVisionLength(vision_length)
     , mNumKVHeads(num_kv_heads)
     , mHeadSize(head_size)
     , mUnidirectional(unidirectional)
     , mQScaling(q_scaling)
+    , mQKTanhScale(qk_tanh_scale)
     , mRotaryEmbeddingDim(rotary_embedding_dim)
     , mRotaryEmbeddingBase(rotary_embedding_base)
     , mRotaryEmbeddingScaleType(rotary_embedding_scale_type)
     , mRotaryEmbeddingScale(rotary_embedding_scale)
+    , mRotaryEmbeddingShortMscale(rotary_embedding_short_m_scale)
+    , mRotaryEmbeddingLongMscale(rotary_embedding_long_m_scale)
     , mRotaryEmbeddingMaxPositions(rotary_embedding_max_positions)
+    , mRotaryEmbeddingOriginalMaxPositions(rotary_embedding_original_max_positions)
     , mPositionEmbeddingType(position_embedding_type)
     , mEnableContextFMHA(context_fmha_type != ContextFMHAType::DISABLED)
     , mFMHAForceFP32Acc(
           context_fmha_type == ContextFMHAType::ENABLED_WITH_FP32_ACC || type == nvinfer1::DataType::kBF16)
     , mMaskType(mask_type)
+    , mBlockSparseParams(block_sparse_params)
     , mType(type)
     , mMultiBlockMode(multi_block_mode)
     , mEnableXQA(enable_xqa)
@@ -403,7 +442,8 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads,
     , mPagedContextFMHA(use_paged_context_fmha)
     , mFP8ContextFMHA(use_fp8_context_fmha)
     , mUseKVCache(use_cache)
-    , mIsMedusaEnabled(is_medusa_enabled)
+    , mIsSpecDecodingEnabled(is_spec_decoding_enabled)
+    , mDriver(CUDADriverWrapper::getInstance())
 {
     // Pre-check whether FMHA is supported in order to save memory allocation.
     if (mEnableContextFMHA)
@@ -461,7 +501,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads,
     }
 }
 
-int const GPTAttentionPluginCommon::getHeadSize(bool checkInit) const
+int GPTAttentionPluginCommon::getHeadSize(bool checkInit) const
 {
     if (checkInit)
     {
@@ -472,22 +512,29 @@ int const GPTAttentionPluginCommon::getHeadSize(bool checkInit) const
 
 // Parameterized constructor
 GPTAttentionPluginCommon::GPTAttentionPluginCommon(void const* data, size_t length)
+    : mDriver(CUDADriverWrapper::getInstance())
 {
     char const *d = reinterpret_cast<char const*>(data), *a = d;
     unsigned int kvCacheQuantMode;
 
     read(d, mLayerIdx);
     read(d, mNumHeads);
+    read(d, mVisionStart);
+    read(d, mVisionLength);
     read(d, mNumKVHeads);
     read(d, mHeadSize);
     read(d, mUnidirectional);
     read(d, mQScaling);
+    read(d, mQKTanhScale);
     read(d, mPositionEmbeddingType);
     read(d, mRotaryEmbeddingDim);
     read(d, mRotaryEmbeddingBase);
     read(d, mRotaryEmbeddingScaleType);
     read(d, mRotaryEmbeddingScale);
+    read(d, mRotaryEmbeddingShortMscale);
+    read(d, mRotaryEmbeddingLongMscale);
     read(d, mRotaryEmbeddingMaxPositions);
+    read(d, mRotaryEmbeddingOriginalMaxPositions);
     read(d, mTpSize);
     read(d, mTpRank);
     read(d, mUnfuseQkvGemm);
@@ -498,6 +545,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(void const* data, size_t leng
     read(d, kvCacheQuantMode);
     read(d, mRemovePadding);
     read(d, mMaskType);
+    read(d, mBlockSparseParams);
     read(d, mPagedKVCache);
     read(d, mTokensPerBlock);
     read(d, mType);
@@ -510,9 +558,15 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(void const* data, size_t leng
     read(d, mPagedContextFMHA);
     read(d, mFP8ContextFMHA);
     read(d, mUseKVCache);
-    read(d, mIsMedusaEnabled);
+    read(d, mIsSpecDecodingEnabled);
+    read(d, mNbMultiBlockSemaphores);
 
     mKVCacheQuantMode = tc::QuantMode(kvCacheQuantMode);
+
+    uint32_t decoderXQARunnerResourceSerializedSize;
+    read(d, decoderXQARunnerResourceSerializedSize);
+    mDecoderXQARunnerResource = DecoderXQARunner::Resource(d, decoderXQARunnerResourceSerializedSize);
+    d += decoderXQARunnerResourceSerializedSize;
 
     TLLM_CHECK_WITH_INFO(d == a + length,
         "Expected length (%d) != real length (%d). This is often "
@@ -523,9 +577,8 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(void const* data, size_t leng
         "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
 }
 
-size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t nbReq,
-    int32_t input_seq_length, int32_t max_attention_window, int32_t cross_qkv_length,
-    int32_t max_num_tokens) const noexcept
+size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t max_num_seq,
+    int32_t input_seq_length, int32_t cross_qkv_length, int32_t max_num_tokens) const noexcept
 {
     int const local_hidden_units_qo = mNumHeads * getHeadSize();
     int const local_hidden_units_kv = mNumKVHeads * getHeadSize();
@@ -535,15 +588,14 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(nvinfer1::DataType t
 
     size_t context_workspace_size = 0;
 
-    int const batch_size = nbReq;
-    size_t const attention_mask_size = mEnableContextFMHA
-        ? 0
-        : size * batch_size * input_seq_length * (isCrossAttention() ? cross_qkv_length : input_seq_length);
-    const size_t cu_seqlens_size = sizeof(int) * (batch_size + 1);
-    const size_t rotary_inv_freq_size = sizeof(float) * batch_size * mRotaryEmbeddingDim / 2;
-    const size_t q_buf_2_size = chunked_context_support
+    auto const batch_size = static_cast<size_t>(max_num_seq);
+    size_t const attention_mask_size
+        = mEnableContextFMHA ? 0 : size * max_num_tokens * (isCrossAttention() ? cross_qkv_length : input_seq_length);
+    size_t const cu_seqlens_size = sizeof(int) * (batch_size + 1);
+    size_t const rotary_inv_freq_size = sizeof(float) * batch_size * mRotaryEmbeddingDim / 2;
+    size_t const q_buf_2_size = chunked_context_support
         ? size * max_num_tokens * local_hidden_units_qo
-        : (!mEnableContextFMHA ? size * batch_size * input_seq_length * local_hidden_units_qo : 0);
+        : (!mEnableContextFMHA ? size * max_num_tokens * local_hidden_units_qo : 0);
     size_t const k_buf_2_size = mEnableContextFMHA
         ? 0
         : size * batch_size * (isCrossAttention() ? cross_qkv_length : input_seq_length) * local_hidden_units_kv;
@@ -553,15 +605,15 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(nvinfer1::DataType t
     size_t const qk_buf_size = mEnableContextFMHA
         ? 0
         : size * batch_size * mNumHeads * input_seq_length * (isCrossAttention() ? cross_qkv_length : input_seq_length);
-    size_t const qkv_buf_2_size = mEnableContextFMHA ? 0 : size * batch_size * input_seq_length * local_hidden_units_qo;
+    size_t const qkv_buf_2_size = mEnableContextFMHA ? 0 : size * max_num_tokens * local_hidden_units_qo;
     size_t const qk_buf_float_size = mEnableContextFMHA ? 0
                                                         : sizeof(float) * batch_size * mNumHeads * input_seq_length
             * (isCrossAttention() ? cross_qkv_length : input_seq_length);
-    size_t const fp8_qkv_buffer_size = mFP8ContextFMHA && mEnableContextFMHA
-        ? batch_size * input_seq_length * size_t(local_hidden_units_qo + 2 * local_hidden_units_kv)
+    size_t const fp8_qkv_buffer_size = mFP8ContextFMHA && mEnableContextFMHA && !chunked_context_support
+        ? max_num_tokens * size_t(local_hidden_units_qo + 2 * local_hidden_units_kv)
         : 0;
-    size_t const padding_offset_size = sizeof(int) * batch_size * input_seq_length;
-    const size_t fmha_scheduler_counter = mEnableContextFMHA ? sizeof(uint32_t) : 0;
+    size_t const padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * max_num_tokens;
+    size_t const fmha_scheduler_counter = mEnableContextFMHA ? sizeof(uint32_t) : 0;
 
     int const NUM_BUFFERS = 14;
     size_t workspaces[NUM_BUFFERS];
@@ -585,7 +637,7 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(nvinfer1::DataType t
 }
 
 size_t GPTAttentionPluginCommon::getWorkspaceSizeForGeneration(
-    nvinfer1::DataType type, int32_t total_num_seq, int32_t max_attention_window) const noexcept
+    nvinfer1::DataType type, int32_t max_num_seq, int32_t max_attention_window, int32_t max_num_tokens) const noexcept
 {
     int const local_hidden_units_qo = mNumHeads * getHeadSize();
     int const local_hidden_units_kv = mNumKVHeads * getHeadSize();
@@ -595,25 +647,23 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForGeneration(
     size_t context_workspace_size = 0;
     size_t generation_workspace_size = 0;
 
-    int const batch_beam = total_num_seq;
+    int const batch_beam = max_num_seq;
     int32_t const maxSeqLenTile
         = std::max(getMaxNumSeqLenTile(batch_beam), (int) tc::divUp(mMultiProcessorCount, mNumHeads));
 
     size_t const partial_out_size = size * batch_beam * mNumHeads * mHeadSize * maxSeqLenTile;
     size_t const partial_sum_size = sizeof(float) * batch_beam * mNumHeads * maxSeqLenTile;
     size_t const partial_max_size = sizeof(float) * batch_beam * mNumHeads * maxSeqLenTile;
-    size_t const block_counter_size = sizeof(int) * batch_beam * mNumHeads;
     size_t const shift_k_cache_size = (!mPosShiftEnabled || isCrossAttention())
         ? 0
         : size * batch_beam * mNumHeads * mHeadSize * max_attention_window;
 
-    int const NUM_BUFFERS = 5;
+    int const NUM_BUFFERS = 4;
     size_t workspaces[NUM_BUFFERS];
     workspaces[0] = partial_out_size;
     workspaces[1] = partial_sum_size;
     workspaces[2] = partial_max_size;
-    workspaces[3] = block_counter_size;
-    workspaces[4] = shift_k_cache_size;
+    workspaces[3] = shift_k_cache_size;
     generation_workspace_size = tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
 
     size_t mqa_workspace_size = 0;
@@ -621,9 +671,9 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForGeneration(
     {
         int const XQA_NUM_BUFFERS = 3;
         size_t mqa_workspaces[XQA_NUM_BUFFERS];
-        const size_t cu_seqlens_size = sizeof(int) * (batch_beam + 1);
-        const size_t rotary_inv_freq_size = sizeof(float) * batch_beam * mRotaryEmbeddingDim / 2;
-        mqa_workspaces[0] = mDecoderXQARunner->getWorkspaceSize(batch_beam);
+        size_t const cu_seqlens_size = sizeof(int) * (batch_beam + 1);
+        size_t const rotary_inv_freq_size = sizeof(float) * batch_beam * mRotaryEmbeddingDim / 2;
+        mqa_workspaces[0] = mDecoderXQARunner->getWorkspaceSize(batch_beam, max_num_tokens);
         mqa_workspaces[1] = cu_seqlens_size;
         mqa_workspaces[2] = rotary_inv_freq_size;
         mqa_workspace_size = tc::calculateTotalWorkspaceSize(mqa_workspaces, XQA_NUM_BUFFERS);
@@ -711,12 +761,13 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
     }
 #endif
 
+    bool const chunked_context_support = mEnableContextFMHA && mPagedKVCache && mPagedContextFMHA;
     size_t const attention_mask_size = mEnableContextFMHA ? 0
                                                           : sizeof(T) * params.batch_size * params.input_seq_length
             * (isCrossAttention() ? params.cross_qkv_length : params.input_seq_length);
-    const size_t cu_seqlens_size = sizeof(int) * (params.batch_size + 1);
-    const size_t rotary_inv_freq_size = sizeof(float) * params.batch_size * mRotaryEmbeddingDim / 2;
-    const size_t q_buf_2_size = (mEnableContextFMHA && mPagedKVCache && mPagedContextFMHA) || !mEnableContextFMHA
+    size_t const cu_seqlens_size = sizeof(int) * (params.batch_size + 1);
+    size_t const rotary_inv_freq_size = sizeof(float) * params.batch_size * mRotaryEmbeddingDim / 2;
+    size_t const q_buf_2_size = chunked_context_support || !mEnableContextFMHA
         ? sizeof(T) * params.batch_size * params.input_seq_length * local_hidden_units_qo
         : 0;
     size_t const k_buf_2_size = mEnableContextFMHA ? 0
@@ -733,12 +784,13 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
     size_t const qk_buf_float_size = mEnableContextFMHA ? 0
                                                         : sizeof(float) * params.batch_size * mNumHeads
             * params.input_seq_length * (isCrossAttention() ? params.cross_qkv_length : params.input_seq_length);
-    size_t const fp8_qkv_buffer_size = mEnableContextFMHA && mFP8ContextFMHA
+    size_t const fp8_qkv_buffer_size = mEnableContextFMHA && mFP8ContextFMHA && !chunked_context_support
         ? params.batch_size * params.input_seq_length * (local_hidden_units_qo + 2 * local_hidden_units_kv)
         : 0;
-    size_t const padding_offset_size
-        = sizeof(int) * params.batch_size * (isCrossAttention() ? params.cross_qkv_length : params.input_seq_length);
-    const size_t fmha_scheduler_counter = mEnableContextFMHA ? sizeof(uint32_t) : 0;
+    size_t const padding_offset_size = mEnableContextFMHA
+        ? 0
+        : sizeof(int) * params.batch_size * (isCrossAttention() ? params.cross_qkv_length : params.input_seq_length);
+    size_t const fmha_scheduler_counter = mEnableContextFMHA ? sizeof(uint32_t) : 0;
 
     bool const is_qk_buf_float_ = true;
 
@@ -759,7 +811,9 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
     float* qk_buf_float_ = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, qk_buf_float_size));
     __nv_fp8_e4m3* fp8_qkv_buffer
         = reinterpret_cast<__nv_fp8_e4m3*>(nextWorkspacePtr(workspace_byte_ptr, offset, fp8_qkv_buffer_size));
-    int* padding_offset = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, padding_offset_size));
+    int* padding_offset = mEnableContextFMHA
+        ? nullptr
+        : reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, padding_offset_size));
     uint32_t* fmha_tile_counter_ptr
         = reinterpret_cast<uint32_t*>(nextWorkspacePtr(workspace_byte_ptr, offset, fmha_scheduler_counter));
 
@@ -783,6 +837,7 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
     decoder_params.sinkTokenLength = params.sink_token_length;
     decoder_params.numTokens = params.num_tokens;
     decoder_params.attentionMaskType = mMaskType;
+    decoder_params.blockSparseParams = mBlockSparseParams;
     decoder_params.fmhaTileCounter = fmha_tile_counter_ptr;
     // Rotary embedding inv_freq buffer.
     decoder_params.rotaryEmbeddingScale = mRotaryEmbeddingScale;
@@ -822,7 +877,6 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
             stream);
     }
 
-    // write KV to cache
     KvCacheDataType const cache_type = mKVCacheQuantMode.hasInt8KvCache()
         ? KvCacheDataType::INT8
         : (mKVCacheQuantMode.hasFp8KvCache() ? KvCacheDataType::FP8 : KvCacheDataType::BASE);
@@ -851,17 +905,67 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
         TLLM_CHECK_WITH_INFO(
             !(mKVCacheQuantMode.hasFp8KvCache() && !mKVCacheQuantMode.hasFp8Qdq() && enablePagedKVContextFMHA),
             "FP8 Paged Context FMHA only works with fp8 quantization workflow currently.");
+        TLLM_CHECK_WITH_INFO(!(params.sink_token_length > 0 && enablePagedKVContextFMHA),
+            "Cannot support StreamingLLM now when enabling paged KV context FMHA.");
 
-        QKVPreprocessingParams<T, KVCacheBuffer> preprocessingParms{const_cast<T*>(params.attention_input),
-            fp8_qkv_buffer, q_buf_2_, kv_cache_buffer, params.qkv_bias, params.q_seq_lengths, params.kv_seq_lengths,
-            cu_q_seqlens, rotary_inv_freq_buf, params.rotary_cos_sin, params.kv_scale_orig_quant, (int*) nullptr,
-            params.batch_size, params.input_seq_length, params.max_past_kv_len, params.cyclic_attention_window_size,
-            params.sink_token_length, params.num_tokens, mNumHeads, mNumKVHeads, mNumHeads / mNumKVHeads, getHeadSize(),
-            mRotaryEmbeddingDim, mRotaryEmbeddingBase, mRotaryEmbeddingScaleType, mRotaryEmbeddingScale,
-            mRotaryEmbeddingMaxPositions, position_embedding_type, mPosShiftEnabled, cache_type,
-            enablePagedKVContextFMHA, mFP8ContextFMHA, mMultiProcessorCount};
+        QKVPreprocessingParams<T, KVCacheBuffer> preprocessingParams;
 
-        invokeQKVPreprocessing(preprocessingParms, stream);
+        preprocessingParams.QKV = const_cast<T*>(params.attention_input);
+        preprocessingParams.QuantizedQKV = fp8_qkv_buffer;
+        preprocessingParams.Q = q_buf_2_;
+        preprocessingParams.kv_cache_buffer = kv_cache_buffer;
+        preprocessingParams.qkv_bias = params.qkv_bias;
+        preprocessingParams.seq_lens = params.q_seq_lengths;
+        preprocessingParams.cache_seq_lens = params.kv_seq_lengths;
+        preprocessingParams.cu_seq_lens = cu_q_seqlens;
+        preprocessingParams.rotary_embedding_inv_freq = rotary_inv_freq_buf;
+        preprocessingParams.rotary_coef_cache_buffer = params.rotary_cos_sin;
+        preprocessingParams.kvScaleOrigQuant = params.kv_scale_orig_quant;
+        preprocessingParams.spec_decoding_position_offsets = nullptr;
+
+        // Scalars
+        preprocessingParams.batch_size = params.batch_size;
+        preprocessingParams.max_input_seq_len = params.input_seq_length;
+        preprocessingParams.max_kv_seq_len = params.max_past_kv_len;
+        preprocessingParams.cyclic_kv_cache_len = params.cyclic_attention_window_size;
+        preprocessingParams.sink_token_len = params.sink_token_length;
+        preprocessingParams.token_num = params.num_tokens;
+        preprocessingParams.head_num = mNumHeads;
+        preprocessingParams.kv_head_num = mNumKVHeads;
+        preprocessingParams.qheads_per_kv_head = mNumHeads / mNumKVHeads;
+        preprocessingParams.size_per_head = getHeadSize();
+        preprocessingParams.rotary_embedding_dim = mRotaryEmbeddingDim;
+        preprocessingParams.rotary_embedding_base = mRotaryEmbeddingBase;
+        preprocessingParams.rotary_scale_type = mRotaryEmbeddingScaleType;
+        preprocessingParams.rotary_embedding_scale = mRotaryEmbeddingScale;
+        preprocessingParams.rotary_embedding_max_positions = mRotaryEmbeddingMaxPositions;
+        preprocessingParams.position_embedding_type = position_embedding_type;
+        preprocessingParams.position_shift_enabled = mPosShiftEnabled;
+        preprocessingParams.cache_type = cache_type;
+        preprocessingParams.enable_paged_kv_fmha = enablePagedKVContextFMHA;
+        preprocessingParams.quantized_fp8_output = mFP8ContextFMHA;
+        preprocessingParams.multi_processor_count = mMultiProcessorCount;
+
+        preprocessingParams.rotary_vision_start = mVisionStart;
+        preprocessingParams.rotary_vision_length = mVisionLength;
+
+        {
+            std::string const beforeRopeStr = "ctx attention before RoPE at layer " + std::to_string(mLayerIdx);
+            TLLM_CHECK_DEBUG_WITH_INFO(tensorrt_llm::runtime::utils::tensorHasNan(params.num_tokens,
+                                           (local_hidden_units_qo + 2 * local_hidden_units_kv), mType,
+                                           const_cast<T*>(params.attention_input), stream, beforeRopeStr)
+                    == false,
+                "Found Nan in " + beforeRopeStr);
+        }
+        invokeQKVPreprocessing(preprocessingParams, stream);
+        {
+            std::string const afterRopeStr = "ctx attention after RoPE at layer " + std::to_string(mLayerIdx);
+            TLLM_CHECK_DEBUG_WITH_INFO(tensorrt_llm::runtime::utils::tensorHasNan(params.num_tokens,
+                                           (local_hidden_units_qo + 2 * local_hidden_units_kv), mType,
+                                           const_cast<T*>(params.attention_input), stream, afterRopeStr)
+                    == false,
+                "Found Nan in " + afterRopeStr);
+        }
 
         sync_check_cuda_error();
 
@@ -876,10 +980,6 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
         //    - cu_q_seqlens: the cumulative query sequence lengths, needed for variable sequence length.
         //    - cu_kv_seqlens: the cumulative kv sequence lengths, needed for variable sequence length.
 
-        if (params.sink_token_length > 0)
-        {
-            TLLM_LOG_ERROR("Cannot support StreamingLLM now when enabling paged KV context FMHA.");
-        }
         // disable sliding window attention when it is not needed.
         int const attention_window_size = mDenseContextFMHA ? params.num_tokens : params.cyclic_attention_window_size;
         // use separate buffer if using fp8 fmh or paged_kv fmha.
@@ -1047,7 +1147,12 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
             param.k_length = attention_seq_len_2;
             param.num_heads = mNumHeads;
             param.qk_scale = qk_scale_softmax;
+            param.qk_tanh_scale = mQKTanhScale;
+            param.qk_tanh_inverse_scale = 1.0f / mQKTanhScale;
             param.linear_bias_slopes = const_cast<T*>(linear_bias_slopes); // (head_num,), optional
+            param.block_sparse_attn = mMaskType == AttentionMaskType::BLOCKSPARSE;
+            param.block_sparse_params = mBlockSparseParams;
+            param.q_seq_lengths = params.q_seq_lengths;
             invokeMaskedSoftmax(param, stream);
         }
         else
@@ -1075,7 +1180,12 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
             param.k_length = attention_seq_len_2;
             param.num_heads = mNumHeads;
             param.qk_scale = qk_scale_softmax;
+            param.qk_tanh_scale = mQKTanhScale;
+            param.qk_tanh_inverse_scale = 1.0f / mQKTanhScale;
             param.linear_bias_slopes = const_cast<T*>(linear_bias_slopes); // (head_num,), optional
+            param.block_sparse_attn = mMaskType == AttentionMaskType::BLOCKSPARSE;
+            param.block_sparse_params = mBlockSparseParams;
+            param.q_seq_lengths = params.q_seq_lengths;
             invokeMaskedSoftmax(param, stream);
         }
 
@@ -1228,6 +1338,10 @@ int GPTAttentionPluginCommon::enqueueGeneration(
     }
     sync_check_cuda_error();
 
+#ifndef NDEBUG
+    debugCheckSemaphores(stream);
+#endif
+
     // Try XQA optimization first.
     {
         // NOTE: input_seq_length = num_medusa_tokens + 1 (new generated one from the original LM head)
@@ -1242,9 +1356,9 @@ int GPTAttentionPluginCommon::enqueueGeneration(
             mDecoderXQARunner->template dispatch<KVCacheBuffer>(xqaParams, kv_cache_buffer, stream);
             return 0;
         }
-        else if (mIsMedusaEnabled)
+        else if (mIsSpecDecodingEnabled)
         {
-            TLLM_CHECK_WITH_INFO(false, "No available XQA kernels are found for medusa mode.");
+            TLLM_CHECK_WITH_INFO(false, "No available XQA kernels are found for speculative decoding mode.");
         }
     }
 
@@ -1276,7 +1390,6 @@ int GPTAttentionPluginCommon::enqueueGeneration(
         = enable_multi_block ? sizeof(float) * batch_beam * mNumHeads * max_num_seq_len_tiles : 0;
     size_t const partial_max_size
         = enable_multi_block ? sizeof(float) * batch_beam * mNumHeads * max_num_seq_len_tiles : 0;
-    size_t const block_counter_size = enable_multi_block ? sizeof(int) * batch_beam * mNumHeads : 0;
     size_t const shift_k_cache_size = (!mPosShiftEnabled || isCrossAttention())
         ? 0
         : sizeof(T) * batch_beam * mNumHeads * mHeadSize * params.max_attention_window;
@@ -1285,13 +1398,7 @@ int GPTAttentionPluginCommon::enqueueGeneration(
     T* partial_out = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, partial_out_size));
     float* partial_sum = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, partial_sum_size));
     float* partial_max = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, partial_max_size));
-    int* block_counter = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, block_counter_size));
     T* shift_k_cache = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, shift_k_cache_size));
-
-    if (enable_multi_block)
-    {
-        TLLM_CUDA_CHECK(cudaMemsetAsync(block_counter, 0, block_counter_size, stream));
-    }
 
     // Apply position embedding to the keys in the K cache
     KVLinearBuffer shift_k_cache_buffer;
@@ -1338,6 +1445,7 @@ int GPTAttentionPluginCommon::enqueueGeneration(
     dispatch_params.input_lengths = params.context_lengths;
     dispatch_params.step = step;
     dispatch_params.q_scaling = q_scaling;
+    dispatch_params.qk_tanh_scale = mQKTanhScale;
     dispatch_params.linear_bias_slopes = isALiBi() ? params.alibi_slopes : nullptr;
     dispatch_params.ia3_tasks = ia3_tasks;
     dispatch_params.ia3_key_weights = ia3_key_weights;
@@ -1352,7 +1460,7 @@ int GPTAttentionPluginCommon::enqueueGeneration(
     dispatch_params.partial_out = partial_out;
     dispatch_params.partial_sum = partial_sum;
     dispatch_params.partial_max = partial_max;
-    dispatch_params.block_counter = block_counter;
+    dispatch_params.block_counter = mMultiBlockSemaphores.get();
     dispatch_params.kv_cache_quant_mode = mKVCacheQuantMode;
     dispatch_params.kv_scale_orig_quant = params.kv_scale_orig_quant;
     dispatch_params.kv_scale_quant_orig = params.kv_scale_quant_orig;
@@ -1362,10 +1470,18 @@ int GPTAttentionPluginCommon::enqueueGeneration(
     dispatch_params.rotary_embedding_base = mRotaryEmbeddingBase;
     dispatch_params.rotary_embedding_scale_type = mRotaryEmbeddingScaleType;
     dispatch_params.rotary_embedding_scale = mRotaryEmbeddingScale;
+    dispatch_params.rotary_embedding_short_m_scale = mRotaryEmbeddingShortMscale;
+    dispatch_params.rotary_embedding_long_m_scale = mRotaryEmbeddingLongMscale;
+    dispatch_params.rotary_embedding_scaling_factors = params.rotary_embedding_scaling_factors;
     dispatch_params.rotary_embedding_max_positions = mRotaryEmbeddingMaxPositions;
+    dispatch_params.rotary_embedding_original_max_positions = mRotaryEmbeddingOriginalMaxPositions;
     dispatch_params.position_shift_enabled = mPosShiftEnabled;
+    dispatch_params.rotary_cogvlm_vision_start = mVisionStart;
+    dispatch_params.rotary_cogvlm_vision_length = mVisionLength;
     dispatch_params.cross_attention = mCrossAttention;
     dispatch_params.memory_length_per_sample = params.encoder_input_lengths;
+    dispatch_params.block_sparse_attention = mMaskType == AttentionMaskType::BLOCKSPARSE;
+    dispatch_params.block_sparse_params = mBlockSparseParams;
 
     using DataType = typename SATypeConverter<T>::Type;
     if (!mCrossAttention)
@@ -1477,12 +1593,13 @@ int GPTAttentionPluginCommon::initialize() noexcept
         // Use Paged KV FMHA or not.
         bool const pagedKVFMHA = mPagedKVCache && mPagedContextFMHA;
         // Load kernels for contiguous cache and paged kv cache at the same time.
-        mFMHARunner.reset(new FusedMHARunnerV2(data_type, pagedKVFMHA, mNumHeads, getHeadSize(false), mQScaling));
+        mFMHARunner.reset(
+            new FusedMHARunnerV2(data_type, pagedKVFMHA, mNumHeads, getHeadSize(false), mQScaling, mQKTanhScale));
         // Set flags: force_fp32_acc, is_s_padded, causal_mask, num_kv_heads.
         mFMHARunner->setup_flags(mFMHAForceFP32Acc, !mRemovePadding, true, mNumKVHeads);
     }
 
-    bool useXQAKernels = (mEnableXQA || mIsMedusaEnabled) && !mCrossAttention
+    bool useXQAKernels = (mEnableXQA || mIsSpecDecodingEnabled) && !mCrossAttention
         && (mType == nvinfer1::DataType::kHALF || mType == nvinfer1::DataType::kBF16);
 
     if (useXQAKernels)
@@ -1497,22 +1614,23 @@ int GPTAttentionPluginCommon::initialize() noexcept
             xqa_runner_data_type = DATA_TYPE_BF16;
         }
         TLLM_LOG_DEBUG("Enabling XQA kernels for GPTAttention.");
-        if (mIsMedusaEnabled)
+        if (mIsSpecDecodingEnabled)
         {
             TLLM_CHECK_WITH_INFO(mNumHeads % mNumKVHeads == 0, "mNumHeads should be multiples of mNumKVHeads.");
-            int numQHeadsPerKV = mNumHeads / mNumKVHeads;
-            bool isPowerOfTwo = ((numQHeadsPerKV & (numQHeadsPerKV - 1)) == 0);
-            TLLM_CHECK_WITH_INFO(isPowerOfTwo,
-                "numQHeadsPerKV should be power of 2 for Medusa, mNumHeads=%d, mNumKVHeads=%d.", mNumHeads,
-                mNumKVHeads);
+            TLLM_CHECK_WITH_INFO(!mMultiBlockMode, "Medusa doesn't support multi-block mode.");
         }
 
-        mDecoderXQARunner.reset(
-            new DecoderXQARunner(xqa_runner_data_type, mNumHeads, mNumKVHeads, mHeadSize, mMultiBlockMode));
+        mDecoderXQARunner.reset(new DecoderXQARunner(
+            &mDecoderXQARunnerResource, xqa_runner_data_type, mNumHeads, mNumKVHeads, mHeadSize, mMultiBlockMode));
     }
-    else if (mIsMedusaEnabled)
+    else if (mIsSpecDecodingEnabled)
     {
-        TLLM_CHECK_WITH_INFO(false, "Medusa mode doesn't support the data type or cross attention.");
+        TLLM_CHECK_WITH_INFO(false, "Speculative decoding mode doesn't support the data type or cross attention.");
+    }
+
+    if (mNbMultiBlockSemaphores != 0)
+    {
+        reserveSemaphoreArray(mNbMultiBlockSemaphores);
     }
 
     return 0;
@@ -1523,18 +1641,23 @@ void GPTAttentionPluginCommon::destroy() noexcept
     delete this;
 }
 
-size_t GPTAttentionPluginCommon::getCommonSerializationSize() noexcept
+size_t GPTAttentionPluginCommon::getCommonSerializationSize() const noexcept
 {
-    return sizeof(mLayerIdx) + sizeof(mNumHeads) + sizeof(mNumKVHeads) + sizeof(mHeadSize) + sizeof(mUnidirectional)
-        + sizeof(mQScaling) + sizeof(mPositionEmbeddingType) + sizeof(mRotaryEmbeddingDim)
-        + sizeof(mRotaryEmbeddingBase) + sizeof(mRotaryEmbeddingScaleType) + sizeof(mRotaryEmbeddingScale)
-        + sizeof(mRotaryEmbeddingMaxPositions) + sizeof(mTpSize) + sizeof(mTpRank) + sizeof(mEnableContextFMHA)
+    return sizeof(mLayerIdx) + sizeof(mNumHeads) + +sizeof(mVisionStart) + sizeof(mVisionLength) + sizeof(mNumKVHeads)
+        + sizeof(mHeadSize) + sizeof(mUnidirectional) + sizeof(mQScaling) + sizeof(mQKTanhScale)
+        + sizeof(mPositionEmbeddingType) + sizeof(mRotaryEmbeddingDim) + sizeof(mRotaryEmbeddingBase)
+        + sizeof(mRotaryEmbeddingScaleType) + sizeof(mRotaryEmbeddingScale) + sizeof(mRotaryEmbeddingShortMscale)
+        + sizeof(mRotaryEmbeddingLongMscale) + sizeof(mRotaryEmbeddingMaxPositions)
+        + sizeof(mRotaryEmbeddingOriginalMaxPositions) + sizeof(mTpSize) + sizeof(mTpRank) + sizeof(mEnableContextFMHA)
         + sizeof(mFMHAForceFP32Acc) + sizeof(mMultiBlockMode) + sizeof(mEnableXQA)
         + sizeof(unsigned int) // mKVCacheQuantMode
-        + sizeof(mRemovePadding) + sizeof(mMaskType) + sizeof(mPagedKVCache) + sizeof(mTokensPerBlock) + sizeof(mType)
-        + sizeof(mMaxContextLength) + sizeof(mQKVBiasEnabled) + sizeof(mCrossAttention) + sizeof(mMaxDistance)
-        + sizeof(mPosShiftEnabled) + sizeof(mDenseContextFMHA) + sizeof(mPagedContextFMHA) + sizeof(mFP8ContextFMHA)
-        + sizeof(mUseKVCache) + sizeof(mUnfuseQkvGemm) + sizeof(mIsMedusaEnabled);
+        + sizeof(mRemovePadding) + sizeof(mMaskType) + sizeof(mBlockSparseParams) + sizeof(mPagedKVCache)
+        + sizeof(mTokensPerBlock) + sizeof(mType) + sizeof(mMaxContextLength) + sizeof(mQKVBiasEnabled)
+        + sizeof(mCrossAttention) + sizeof(mMaxDistance) + sizeof(mPosShiftEnabled) + sizeof(mDenseContextFMHA)
+        + sizeof(mPagedContextFMHA) + sizeof(mFP8ContextFMHA) + sizeof(mUseKVCache) + sizeof(mUnfuseQkvGemm)
+        + sizeof(mIsSpecDecodingEnabled) + sizeof(mNbMultiBlockSemaphores)
+        + sizeof(uint32_t) // size of mDecoderXQARunnerResource buffer.
+        + mDecoderXQARunnerResource.getSerializationSize();
 }
 
 void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
@@ -1542,16 +1665,22 @@ void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
     char *d = static_cast<char*>(buffer), *a = d;
     write(d, mLayerIdx);
     write(d, mNumHeads);
+    write(d, mVisionStart);
+    write(d, mVisionLength);
     write(d, mNumKVHeads);
     write(d, mHeadSize);
     write(d, mUnidirectional);
     write(d, mQScaling);
+    write(d, mQKTanhScale);
     write(d, mPositionEmbeddingType);
     write(d, mRotaryEmbeddingDim);
     write(d, mRotaryEmbeddingBase);
     write(d, mRotaryEmbeddingScaleType);
     write(d, mRotaryEmbeddingScale);
+    write(d, mRotaryEmbeddingShortMscale);
+    write(d, mRotaryEmbeddingLongMscale);
     write(d, mRotaryEmbeddingMaxPositions);
+    write(d, mRotaryEmbeddingOriginalMaxPositions);
     write(d, mTpSize);
     write(d, mTpRank);
     write(d, mUnfuseQkvGemm);
@@ -1562,6 +1691,7 @@ void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
     write(d, mKVCacheQuantMode.value());
     write(d, mRemovePadding);
     write(d, mMaskType);
+    write(d, mBlockSparseParams);
     write(d, mPagedKVCache);
     write(d, mTokensPerBlock);
     write(d, mType);
@@ -1574,13 +1704,50 @@ void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
     write(d, mPagedContextFMHA);
     write(d, mFP8ContextFMHA);
     write(d, mUseKVCache);
-    write(d, mIsMedusaEnabled);
+    write(d, mIsSpecDecodingEnabled);
+    write(d, mNbMultiBlockSemaphores);
+
+    // An uint32_t that specifies the size of the serialized buffer, followed by the actual content.
+    uint32_t decoderXQARunnerResourceSerializedSize = mDecoderXQARunnerResource.getSerializationSize();
+    write(d, decoderXQARunnerResourceSerializedSize);
+    mDecoderXQARunnerResource.serialize(d, decoderXQARunnerResourceSerializedSize);
+    d += decoderXQARunnerResourceSerializedSize;
+
     assert(d == a + getCommonSerializationSize());
 }
 
 void GPTAttentionPluginCommon::terminate() noexcept
 {
     // Do nothing, destroy will always be called, so release the resources there.
+}
+
+void GPTAttentionPluginCommon::reserveSemaphoreArray(int32_t size)
+{
+    if (size == 0 || (size <= mNbMultiBlockSemaphores && mMultiBlockSemaphores != nullptr))
+    {
+        return;
+    }
+    int32_t* ptr;
+    deviceMalloc(&ptr, size, false);
+    deviceMemSetZero(ptr, size);
+    mMultiBlockSemaphores.reset(ptr);
+    mNbMultiBlockSemaphores = size;
+}
+
+void GPTAttentionPluginCommon::debugCheckSemaphores(cudaStream_t stream)
+{
+#ifdef NDEBUG
+    TLLM_CHECK_WITH_INFO(false, "debugCheckSemaphores should not be called in release build");
+#endif
+    if (mNbMultiBlockSemaphores == 0)
+    {
+        return;
+    }
+    std::vector<uint32_t> hostBuf(mNbMultiBlockSemaphores);
+    TLLM_CUDA_CHECK(cudaMemcpyAsync(hostBuf.data(), mMultiBlockSemaphores.get(),
+        sizeof(uint32_t) * mNbMultiBlockSemaphores, cudaMemcpyDeviceToHost, stream));
+    TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+    TLLM_CHECK(std::count(hostBuf.begin(), hostBuf.end(), 0U) == mNbMultiBlockSemaphores);
 }
 
 ///////////////
@@ -1590,16 +1757,24 @@ GPTAttentionPluginCreatorCommon::GPTAttentionPluginCreatorCommon()
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
     mPluginAttributes.emplace_back(PluginField("num_heads", nullptr, PluginFieldType::kINT32, -1));
+    mPluginAttributes.emplace_back(PluginField("vision_start", nullptr, PluginFieldType::kINT32, -1));
+    mPluginAttributes.emplace_back(PluginField("vision_length", nullptr, PluginFieldType::kINT32, -1));
     mPluginAttributes.emplace_back(PluginField("num_kv_heads", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("head_size", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("unidirectional", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("q_scaling", nullptr, PluginFieldType::kFLOAT32, 1.0));
+    mPluginAttributes.emplace_back(PluginField("qk_tanh_scale", nullptr, PluginFieldType::kFLOAT32, 0.0));
     mPluginAttributes.emplace_back(PluginField("position_embedding_type", nullptr, PluginFieldType::kINT8, 0));
     mPluginAttributes.emplace_back(PluginField("rotary_embedding_dim", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("rotary_embedding_base", nullptr, PluginFieldType::kFLOAT32, 0));
     mPluginAttributes.emplace_back(PluginField("rotary_embedding_scale_type", nullptr, PluginFieldType::kINT8, 0));
     mPluginAttributes.emplace_back(PluginField("rotary_embedding_scale", nullptr, PluginFieldType::kFLOAT32, 0));
+    mPluginAttributes.emplace_back(
+        PluginField("rotary_embedding_short_m_scale", nullptr, PluginFieldType::kFLOAT32, 0));
+    mPluginAttributes.emplace_back(PluginField("rotary_embedding_long_m_scale", nullptr, PluginFieldType::kFLOAT32, 0));
     mPluginAttributes.emplace_back(PluginField("rotary_embedding_max_positions", nullptr, PluginFieldType::kINT32, 0));
+    mPluginAttributes.emplace_back(
+        PluginField("rotary_embedding_original_max_positions", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("tp_size", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("tp_rank", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("unfuse_qkv_gemm", nullptr, PluginFieldType::kINT8, 0));
@@ -1621,7 +1796,7 @@ GPTAttentionPluginCreatorCommon::GPTAttentionPluginCreatorCommon()
     mPluginAttributes.emplace_back(PluginField("use_paged_context_fmha", nullptr, PluginFieldType::kINT8, 0));
     mPluginAttributes.emplace_back(PluginField("use_fp8_context_fmha", nullptr, PluginFieldType::kINT8, 0));
     mPluginAttributes.emplace_back(PluginField("use_cache", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("is_medusa_enabled", nullptr, PluginFieldType::kINT8, 0));
+    mPluginAttributes.emplace_back(PluginField("is_spec_decoding_enabled", nullptr, PluginFieldType::kINT8, 0));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }

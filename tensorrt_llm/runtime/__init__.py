@@ -14,19 +14,21 @@
 # limitations under the License.
 from .generation import SamplingConfig  # autoflake: skip
 from .generation import (ChatGLMGenerationSession, GenerationSession,
-                         LogitsProcessor, LogitsProcessorList,
-                         MambaLMHeadModelGenerationSession, ModelConfig,
+                         LogitsProcessor, LogitsProcessorList, ModelConfig,
                          QWenForCausalLMGenerationSession, StoppingCriteria,
-                         StoppingCriteriaList, to_word_list_format)
+                         StoppingCriteriaList, decode_words_list)
 from .kv_cache_manager import GenerationSequence, KVCacheManager
 from .model_runner import ModelRunner
 from .session import Session, TensorInfo
 
 try:
-    from .model_runner_cpp import ModelRunnerCpp
+    import tensorrt_llm.bindings  # NOQA
     PYTHON_BINDINGS = True
 except ImportError:
     PYTHON_BINDINGS = False
+
+if PYTHON_BINDINGS:
+    from .model_runner_cpp import ModelRunnerCpp
 
 __all__ = [
     'ModelConfig',
@@ -38,7 +40,7 @@ __all__ = [
     'TensorInfo',
     'ChatGLMGenerationSession',
     'QWenForCausalLMGenerationSession',
-    'to_word_list_format',
+    'decode_words_list',
     'LogitsProcessorList',
     'LogitsProcessor',
     'StoppingCriteriaList',
@@ -46,5 +48,4 @@ __all__ = [
     'ModelRunner',
     'ModelRunnerCpp',
     'PYTHON_BINDINGS',
-    'MambaLMHeadModelGenerationSession',
 ]

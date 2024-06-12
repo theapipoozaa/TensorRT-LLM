@@ -46,27 +46,32 @@ public:
     TransformerBuffers(
         TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);
 
-    void reshape(GenerationConfig const& generationConfig, KvCacheManager const* kvCacheManager,
-        ModelConfig const& modelConfig, WorldConfig const& worldConfig);
+    void reshape(
+        GenerationConfig const& generationConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
-    void reset(BufferManager& manager);
+    void reshapeKvTensors(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxBlocksPerSeq,
+        runtime::TllmRuntime const& runtime);
 
-    TransformerBuffers sliceTo(
-        GenerationConfig const& generationConfig, ModelConfig const& modelConfig, SizeType offset, SizeType batchSize);
+    void setKvPoolPointers(KvCacheManager const* kvCacheManager);
 
-    void prepareContextStep(RuntimeBuffers* runtimeBuffers, TensorPtr const& inputIds, TokenIdType const padId,
-        BufferManager& manager, KvCacheManager const* kvCacheManager, SizeType firstBatchSlotIdx,
+    void reset(BufferManager& manager){};
+
+    TransformerBuffers sliceTo(GenerationConfig const& generationConfig, ModelConfig const& modelConfig,
+        SizeType32 offset, SizeType32 batchSize);
+
+    void prepareContextStep(RuntimeBuffers* runtimeBuffers, TensorPtr const& inputIds, TokenIdType padId,
+        BufferManager& manager, KvCacheManager const* kvCacheManager, SizeType32 firstBatchSlotIdx,
         ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     void postContextStep(RuntimeBuffers* runtimeBuffers, std::vector<RuntimeBuffers> const& contextBuffers,
         BufferManager& manager, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
-    void prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeType const step, BufferManager& manager,
-        KvCacheManager* kvCacheManager, SizeType firstBatchSlotIdx, ModelConfig const& modelConfig,
+    void prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeType32 step, BufferManager& manager,
+        KvCacheManager* kvCacheManager, SizeType32 firstBatchSlotIdx, ModelConfig const& modelConfig,
         WorldConfig const& worldConfig);
 
     void getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers, TensorMap& inputBuffers, TensorMap& outputBuffers,
-        SizeType const step, TensorPtr const& inputIds, TensorPtr const& commPtrs, ModelConfig const& modelConfig,
+        SizeType32 step, TensorPtr const& inputIds, ModelConfig const& modelConfig,
         WorldConfig const& worldConfig) const;
 
 protected:

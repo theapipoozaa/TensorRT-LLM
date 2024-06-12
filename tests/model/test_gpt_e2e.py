@@ -31,9 +31,9 @@ PAD_ID = 50256
 
 work_dir = Path(__file__).parent.resolve() / 'check_gpt'
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '../utils'))
-from llm_data import llm_models_root
-from util import getSMVersion
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.llm_data import llm_models_root
+from utils.util import getSMVersion
 
 gpt_example_root = os.path.join(os.path.dirname(__file__), '../../examples/gpt')
 
@@ -112,30 +112,27 @@ def build_engines():
     convert_ckpt(str(gpt2_dir), str(fp16_ckpt_dir), "--dtype=float16")
 
     print("\nBuilding fp16 engines")
-    build_engine(str(fp16_ckpt_dir), str(engine_dir / 'fp16-default/1-gpu'),
-                 '--strongly_typed')
+    build_engine(str(fp16_ckpt_dir), str(engine_dir / 'fp16-default/1-gpu'))
     build_engine(str(fp16_ckpt_dir), str(engine_dir / 'fp16-plugin/1-gpu'),
-                 '--gpt_attention_plugin=float16', '--strongly_typed')
+                 '--gpt_attention_plugin=float16')
 
     # Skip tests that are not supported in pre-ampere architecture
     if getSMVersion() >= 80:
         build_engine(str(fp16_ckpt_dir),
                      str(engine_dir / 'fp16-plugin-fmha/1-gpu'),
-                     '--gpt_attention_plugin=float16', '--context_fmha=enable',
-                     '--strongly_typed')
+                     '--gpt_attention_plugin=float16', '--context_fmha=enable')
 
     build_engine(str(fp16_ckpt_dir),
                  str(engine_dir / 'fp16-plugin-packed/1-gpu'),
                  '--gpt_attention_plugin=float16',
-                 '--remove_input_padding=enable', '--strongly_typed')
+                 '--remove_input_padding=enable')
 
     # Skip tests that are not supported in pre-ampere architecture
     if getSMVersion() >= 80:
         build_engine(fp16_ckpt_dir,
                      str(engine_dir / 'fp16-plugin-packed-fmha/1-gpu'),
                      '--gpt_attention_plugin=float16',
-                     '--remove_input_padding=enable', '--context_fmha=enable',
-                     '--strongly_typed')
+                     '--remove_input_padding=enable', '--context_fmha=enable')
 
     print("Done.")
 

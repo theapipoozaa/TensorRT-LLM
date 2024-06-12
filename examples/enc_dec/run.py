@@ -21,6 +21,7 @@ from pathlib import Path
 import torch
 import tensorrt as trt
 # isort: on
+import numpy as np
 from transformers import (AutoConfig, AutoModelForSeq2SeqLM, AutoTokenizer,
                           BartForConditionalGeneration,
                           MBartForConditionalGeneration,
@@ -90,6 +91,9 @@ def read_config(config_path: Path):
     use_custom_all_reduce = plugin_config.get('use_custom_all_reduce', False)
     dtype = pretrained_config["dtype"]
 
+    paged_kv_cache = plugin_config['paged_kv_cache']
+    tokens_per_block = plugin_config['tokens_per_block']
+
     gather_context_logits = builder_config.get('gather_context_logits', False)
     gather_generation_logits = builder_config.get('gather_generation_logits',
                                                   False)
@@ -107,6 +111,8 @@ def read_config(config_path: Path):
         num_layers=num_layers,
         gpt_attention_plugin=use_gpt_attention_plugin,
         remove_input_padding=remove_input_padding,
+        paged_kv_cache=paged_kv_cache,
+        tokens_per_block=tokens_per_block,
         cross_attention=cross_attention,
         has_position_embedding=has_position_embedding,
         has_token_type_embedding=has_token_type_embedding,
@@ -147,6 +153,10 @@ def parse_arguments():
                         action='store_true')
     parser.add_argument('--lora_dir', type=str, default=None, nargs="+")
     parser.add_argument('--lora_task_uids', type=str, default=None, nargs="+")
+    parser.add_argument("--output_npy",
+                        type=str,
+                        default=None,
+                        help="Store input/output tensors C++ runtime testing")
     return parser.parse_args()
 
 
@@ -211,11 +221,13 @@ class TRTLLMEncDecModel:
             self.encoder_model_config, self.encoder_runtime_mapping, encoder_engine_buffer = engine_setup(
                 component='encoder')
 
-            # for Pipeline Parallelism in encoder
-            self.nccl_comm = torch.classes.trtllm.NcclCommunicatorOp(
-                self.encoder_runtime_mapping.tp_size,
-                self.encoder_runtime_mapping.pp_size,
-                self.encoder_runtime_mapping.rank)
+            self.nccl_comm = None
+            if self.encoder_runtime_mapping.has_pp():
+                # for Pipeline Parallelism in encoder
+                self.nccl_comm = torch.classes.trtllm.NcclCommunicatorOp(
+                    self.encoder_runtime_mapping.tp_size,
+                    self.encoder_runtime_mapping.pp_size,
+                    self.encoder_runtime_mapping.rank)
 
             # session setup
             self.encoder_session = tensorrt_llm.runtime.Session.from_serialized_engine(
@@ -225,11 +237,11 @@ class TRTLLMEncDecModel:
             if self.encoder_model_config.lora_plugin:
                 self.encoder_lora_manager = LoraManager()
                 # TODO: this is only for bart
-                self.encoder_lora_manager.load_from_hf_bart(
-                    component='encoder',
+                self.encoder_lora_manager.load_from_hf(
                     model_dirs=lora_dir,
                     model_config=self.encoder_model_config,
                     runtime_mapping=self.encoder_runtime_mapping,
+                    component='encoder',
                 )
             else:
                 self.encoder_lora_manager = None
@@ -249,11 +261,11 @@ class TRTLLMEncDecModel:
         if self.decoder_model_config.lora_plugin:
             self.decoder_lora_manager = LoraManager()
             # TODO: this is only for bart
-            self.decoder_lora_manager.load_from_hf_bart(
-                component='decoder',
+            self.decoder_lora_manager.load_from_hf(
                 model_dirs=lora_dir,
                 model_config=self.decoder_model_config,
                 runtime_mapping=self.decoder_runtime_mapping,
+                component='decoder',
             )
         else:
             self.decoder_lora_manager = None
@@ -375,52 +387,19 @@ class TRTLLMEncDecModel:
             (max_input_length, ),
             dtype=hidden_states_dtype('max_input_length'),
             device=self.device).contiguous()
+        batch_size = input_lengths.size(0)
+        inputs['host_request_types'] = torch.IntTensor([0] *
+                                                       batch_size).to('cpu')
+        if self.encoder_model_config.remove_input_padding:
+            inputs['host_context_lengths'] = input_lengths.to('cpu')
 
         if self.encoder_model_config.lora_plugin and self.encoder_lora_manager is not None:
-            batch_size = input_lengths.size(0)
-            missing_qkv_modules = []
-            if any(x in self.encoder_model_config.lora_target_modules
-                   for x in ["attn_q", "attn_k", "attn_v"]):
-                for lora_module in ["attn_q", "attn_k", "attn_v"]:
-                    if lora_module not in self.encoder_model_config.lora_target_modules:
-                        missing_qkv_modules.append(lora_module)
-
-            for layer_idx in range(self.encoder_model_config.num_layers):
-                for lora_module in (
-                        self.encoder_model_config.lora_target_modules +
-                        missing_qkv_modules):
-                    lora_ranks = []
-                    lora_ptrs = []
-                    for batch_idx in range(batch_size):
-                        lora_uid = self.lora_task_uids[batch_idx]
-                        if lora_uid is not None and lora_uid != "-1" and self.encoder_lora_manager.uid_to_low_ranks(
-                                lora_uid)[layer_idx][lora_module] != 0:
-                            lora_ranks.append(
-                                self.encoder_lora_manager.uid_to_low_ranks(
-                                    lora_uid)[layer_idx][lora_module])
-                            lora_ptrs.append(
-                                self.encoder_lora_manager.
-                                lora_weights_pointers_list[layer_idx][lora_uid]
-                                [lora_module])
-                        else:
-                            lora_ranks.append(0)
-                            lora_ptrs.append([0, 0])
-                    inputs.update({
-                        f'{lora_module}_lora_ranks_{layer_idx}':
-                        torch.IntTensor(lora_ranks),
-                    })
-                    inputs.update({
-                        f'{lora_module}_lora_weights_pointers_{layer_idx}':
-                        torch.LongTensor(lora_ptrs),
-                    })
-            inputs.update({
-                'host_request_types':
-                torch.IntTensor([0] * batch_size).to('cpu'),
-            })
-            if self.encoder_model_config.remove_input_padding:
-                inputs.update({
-                    'host_context_lengths': input_lengths.to('cpu'),
-                })
+            inputs.update(
+                self.encoder_lora_manager.input_buffers(
+                    self.lora_task_uids,
+                    self.encoder_runtime_mapping,
+                    self.encoder_model_config.num_layers,
+                ))
 
         # Note: runtime.Session's run() method will set input/output tensor address, here we only need to provide tensor shape
         self.encoder_session.set_shapes(inputs)
@@ -501,23 +480,22 @@ class TRTLLMEncDecModel:
 
         return encoder_output
 
-    def generate(
-        self,
-        encoder_input_ids,
-        decoder_input_ids,
-        max_new_tokens,
-        num_beams=1,
-        pad_token_id=None,
-        eos_token_id=None,
-        bos_token_id=None,
-        debug_mode=False,
-        return_dict=False,
-        prompt_embedding_table=None,
-        prompt_tasks=None,
-        prompt_vocab_size=None,
-        attention_mask=None,
-        time_encoder=False,
-    ):
+    def generate(self,
+                 encoder_input_ids,
+                 decoder_input_ids,
+                 max_new_tokens,
+                 num_beams=1,
+                 pad_token_id=None,
+                 eos_token_id=None,
+                 bos_token_id=None,
+                 debug_mode=False,
+                 return_dict=False,
+                 prompt_embedding_table=None,
+                 prompt_tasks=None,
+                 prompt_vocab_size=None,
+                 attention_mask=None,
+                 time_encoder=False,
+                 return_encoder_output=False):
         ## ensure all externally provided tensors are on the correct device.
         encoder_input_ids = encoder_input_ids.to(self.device)
         decoder_input_ids = decoder_input_ids.to(self.device)
@@ -603,6 +581,9 @@ class TRTLLMEncDecModel:
             return_dict=return_dict,
             cross_attention_mask=cross_attention_mask)
 
+        if return_dict and return_encoder_output:
+            output['encoder_output'] = encoder_output
+
         return output
 
 
@@ -665,6 +646,7 @@ def test_fairseq_models(args):
         eos_token_id=eos_token_id,
         debug_mode=args.debug_mode,
     )
+    torch.cuda.synchronize()
     tok = time.time()
 
     if return_dict:
@@ -715,6 +697,24 @@ if __name__ == "__main__":
             "summarize: I am a high-performance inference optimizer and runtime.",
             "During its construction, the Eiffel Tower surpassed the Washington Monument to become the tallest man-made structure in the world",
         ]
+
+    # TRT-LLM runtime
+    tllm_model = TRTLLMEncDecModel.from_engine(args.engine_name,
+                                               args.engine_dir,
+                                               args.lora_dir,
+                                               args.lora_task_uids,
+                                               debug_mode=args.debug_mode)
+
+    inference_dtype = tllm_model.encoder_model_config.dtype
+    if inference_dtype == 'float32':
+        if "byt5" in args.model_name:
+            print(
+                "ByT5 models tokenize input by bytes instead of words, causing the input text in this example to be longer than the default value during build stage. Please adjust --max_input_len during trtllm-build to select the right length limit for ByT5 models."
+            )
+        else:
+            input_text.append(
+                "Summarize this article in one sentence.\n\nKristine Watts (Molie Weeks) is broken apart, missing her lover; she is not able to overcome her love for him that is lost in the past. She hires a stranger (Douglas Davis) and gives a list of her mistakes to him with things to fix. But time is irreversible and sometimes the cure for the pain is a tragic end.\n\nThe first point that impresses in \"The Cure\" is the stylish cinematography that alternates black and white with color. The concise and sharp screenplay is capable to develop a tragic and bleak tale of love with an unexpected plot point in the very end in less than eight minutes. The soundtrack is beautiful but the volume is a little loud and associated to the fact that English is not my native language, in some moments I needed to repeat some words whispered by the narrator. The unknown lead actress has magnificent performance and is extremely gorgeous. I hope to have a chance to see her again on the screen. Last but not the least, the debut of the director and writer Ryan Jafri could not be better. My vote is nine.\n\nTitle (Brazil): Not Available",
+            )
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name)  # TODO: use model path instead
@@ -800,14 +800,7 @@ if __name__ == "__main__":
             print(f"HF E2E time {(tok-tik)*1000}ms")
             print("--------------------------------------")
 
-    # TRT-LLM runtime
-    tllm_model = TRTLLMEncDecModel.from_engine(args.engine_name,
-                                               args.engine_dir,
-                                               args.lora_dir,
-                                               args.lora_task_uids,
-                                               debug_mode=args.debug_mode)
-
-    return_dict = False  # when set return_dict=True, get outputs by key
+    return_dict = True  # when set return_dict=True, get outputs by key
     tik = time.time()
     tllm_output = tllm_model.generate(
         encoder_input_ids=input_ids,
@@ -820,17 +813,17 @@ if __name__ == "__main__":
         debug_mode=args.debug_mode,
         return_dict=return_dict,
         attention_mask=tokenized_inputs.attention_mask,
-        time_encoder=True)
+        time_encoder=True,
+        return_encoder_output=args.output_npy and tensorrt_llm.mpi_rank() == 0)
+    torch.cuda.synchronize()
     tok = time.time()
 
-    if return_dict:
-        tllm_output_ids = tllm_output['output_ids']
-    else:
-        tllm_output_ids = tllm_output
-
-    inference_dtype = tllm_model.encoder_model_config.dtype
-
     if tensorrt_llm.mpi_rank() == 0:
+        if return_dict:
+            tllm_output_ids = tllm_output['output_ids']
+        else:
+            tllm_output_ids = tllm_output
+
         output_ids = tllm_output_ids[:, 0, :]
         output_text = tokenizer.batch_decode(output_ids,
                                              skip_special_tokens=True)
@@ -838,6 +831,7 @@ if __name__ == "__main__":
                                  tokenizer.pad_token_id).sum(dim=1)
         output_gen_lengths = (output_ids != tokenizer.eos_token_id).sum(
             dim=1) - decoder_input_lengths
+
         print("--------------------------------------")
         print("TRT-LLM output_ids: ", output_ids)
         print("TRT-LLM output text: ", output_text)
@@ -845,6 +839,34 @@ if __name__ == "__main__":
         print(f"TRT-LLM E2E time {(tok-tik)*1000}ms")
         print("Precision:", inference_dtype)
         print("--------------------------------------")
+
+        # save input/output tensors for C++ runtime testing
+        if args.output_npy:
+            os.makedirs(args.output_npy, exist_ok=True)
+
+            input_lengths = tokenized_inputs.attention_mask.sum(dim=1).type(
+                torch.IntTensor)
+            input_ids = tokenized_inputs.input_ids.type(torch.IntTensor)
+            input_ids_flatten = torch.cat([
+                input_ids[i][:input_lengths[i]]
+                for i in range(len(input_lengths))
+            ])
+            encoder_output = tllm_output['encoder_output'].type(torch.float16)
+
+            def save_npy(tensor, name):
+                np.save(os.path.join(args.output_npy, f'{name}.npy'),
+                        tensor.cpu().numpy())
+
+            print(
+                f"Saving input/output tensors to {args.output_npy} for C++ runtime testing"
+            )
+            save_npy(input_ids_flatten, 'input_ids')  # [num_tokens]
+            save_npy(input_lengths, 'input_lengths')  # [batch_size]
+            save_npy(encoder_output,
+                     'encoder_output')  # [num_tokens, hidden_size]
+            save_npy(
+                output_ids, 'output_ids'
+            )  # [batch_size, max_output_tokens], max_output_tokens = decoder_input_tokens + max_new_tokens
 
         # simple accuracy check
         if args.compare_hf_fp32:
@@ -858,7 +880,9 @@ if __name__ == "__main__":
                 print(
                     f"[CAVEAT] Comparing TRT-LLM {inference_dtype} results with HF float32 results. Close match are not expected!"
                 )
-            assert match_rate > 0.8, f"Incorrect results! Match rate {match_rate}"
+                assert match_rate > 0.8, f"Incorrect results! Match rate {match_rate}"
+            else:
+                assert match_rate > 0.95, f"Incorrect results! Match rate {match_rate}"
             print(
                 f"TRT-LLM results match HF FP32 results with literal match rate {match_rate}"
             )

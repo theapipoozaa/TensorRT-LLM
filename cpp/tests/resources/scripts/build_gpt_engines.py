@@ -173,11 +173,30 @@ def build_engines(model_cache: Optional[str] = None, world_size: int = 1):
     ]
     build_engine(str(fp16_ckpt_dir),
                  str(engine_dir / 'fp16-plugin-packed-paged' / tp_pp_dir),
-                 '--max_draft_len=5', *ifb_args)
+                 *ifb_args)
+    build_engine(
+        str(fp16_ckpt_dir),
+        str(engine_dir / 'fp16-plugin-packed-paged-draft-tokens' / tp_pp_dir),
+        '--max_draft_len=5',
+        '--speculative_decoding_mode=draft_tokens_external', *ifb_args)
+    build_engine(
+        str(fp16_ckpt_dir),
+        str(engine_dir / 'fp16-plugin-packed-paged-nprofiles' / tp_pp_dir),
+        '--multiple_profiles=enable', *ifb_args)
     build_engine(str(fp16_ckpt_dir),
                  str(engine_dir / 'fp16-plugin-packed-paged-in128' / tp_pp_dir),
                  *ifb_args,
                  max_input_len=128)
+
+    # Build the target model with return accepted token logits
+    # Build with '--max_draft_len', '--speculative_decoding_mode' and '--gather_generation_logits'
+    build_engine(
+        str(fp16_ckpt_dir),
+        str(engine_dir /
+            'fp16-plugin-packed-paged-return-accepted-tokens-logits' /
+            tp_pp_dir), '--max_draft_len=5',
+        '--speculative_decoding_mode=draft_tokens_external',
+        '--gather_generation_logits', *ifb_args)
 
     # We build almost the same engine twice. But this engine has gather_all_token_logits
     # to extract logits from python runtime and uses context FMHA for generation to match draft model executions,
@@ -187,12 +206,12 @@ def build_engines(model_cache: Optional[str] = None, world_size: int = 1):
         str(fp16_ckpt_dir),
         str(engine_dir / 'fp16-plugin-packed-paged-gather' / tp_pp_dir),
         '--gather_all_token_logits', *ifb_args)
-    # '--use_context_fmha_for_generation', *ifb_args) # Commented out because of `--use_context_fmha_for_generation` has bugs now: https://nvbugspro.nvidia.com/bug/4476681
+
     build_engine(
         str(fp16_ckpt_dir),
-        str(engine_dir / 'fp16-plugin-packed-paged-context-fmha-for-gen' /
-            tp_pp_dir), '--use_context_fmha_for_generation=enable',
-        '--max_draft_len=5', *ifb_args)
+        str(engine_dir / 'fp16-plugin-packed-paged-la-decoding' / tp_pp_dir),
+        '--max_draft_len=64', '--speculative_decoding_mode=lookahead_decoding',
+        *ifb_args)
 
     # build engine with lora enabled
     build_engine(str(fp16_ckpt_dir),
@@ -200,11 +219,14 @@ def build_engines(model_cache: Optional[str] = None, world_size: int = 1):
                  "--lora_target_modules=attn_qkv", '--lora_plugin=float16',
                  *ifb_args)
 
+    llm_datasets_root = Path(model_cache) / "datasets"
+    calib_dataset = llm_datasets_root / "cimec/lambada/"
     print("\nConverting to fp16 SQ")
     fp16_sq_ckpt_dir = ckpt_dir / 'fp16-sq' / tp_dir
     convert_ckpt(str(hf_dir),
                  str(fp16_sq_ckpt_dir),
                  "--smoothquant=0.5",
+                 f"--calib_dataset={calib_dataset}",
                  world_size=tp_size,
                  dtype='float16')
 

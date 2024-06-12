@@ -31,14 +31,15 @@ namespace tensorrt_llm::runtime
 class GptJsonConfig
 {
 public:
-    GptJsonConfig(std::string name, std::string version, std::string precision, SizeType tensorParallelism,
-        SizeType pipelineParallelism, ModelConfig const& modelConfig)
+    GptJsonConfig(std::string name, std::string version, std::string precision, SizeType32 tensorParallelism,
+        SizeType32 pipelineParallelism, SizeType32 gpusPerNode, ModelConfig modelConfig)
         : mName(std::move(name))
         , mVersion(std::move(version))
         , mPrecision(std::move(precision))
         , mTensorParallelism{tensorParallelism}
         , mPipelineParallelism{pipelineParallelism}
-        , mModelConfig(modelConfig)
+        , mGpusPerNode{gpusPerNode}
+        , mModelConfig(std::move(modelConfig))
     {
     }
 
@@ -48,7 +49,12 @@ public:
 
     static GptJsonConfig parse(std::filesystem::path const& path);
 
-    [[nodiscard]] ModelConfig getModelConfig() const
+    [[nodiscard]] ModelConfig const& getModelConfig() const
+    {
+        return mModelConfig;
+    }
+
+    [[nodiscard]] ModelConfig& getModelConfigMutable()
     {
         return mModelConfig;
     }
@@ -68,17 +74,22 @@ public:
         return mPrecision;
     }
 
-    [[nodiscard]] SizeType constexpr getTensorParallelism() const
+    [[nodiscard]] SizeType32 constexpr getTensorParallelism() const
     {
         return mTensorParallelism;
     }
 
-    [[nodiscard]] SizeType constexpr getPipelineParallelism() const
+    [[nodiscard]] SizeType32 constexpr getPipelineParallelism() const
     {
         return mPipelineParallelism;
     }
 
-    [[nodiscard]] SizeType constexpr getWorldSize() const
+    [[nodiscard]] SizeType32 constexpr getGpusPerNode() const
+    {
+        return mGpusPerNode;
+    }
+
+    [[nodiscard]] SizeType32 constexpr getWorldSize() const
     {
         return mTensorParallelism * mPipelineParallelism;
     }
@@ -94,9 +105,10 @@ private:
     std::string const mName;
     std::string const mVersion;
     std::string const mPrecision;
-    SizeType const mTensorParallelism;
-    SizeType const mPipelineParallelism;
-    ModelConfig const mModelConfig;
+    SizeType32 const mTensorParallelism;
+    SizeType32 const mPipelineParallelism;
+    SizeType32 const mGpusPerNode;
+    ModelConfig mModelConfig; // remove const qualifier because config has to mutable after json parsing
 };
 
 } // namespace tensorrt_llm::runtime

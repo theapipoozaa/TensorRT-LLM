@@ -16,30 +16,32 @@
  */
 #pragma once
 
+#include "pluginUtils.h"
+#include "tensorrt_llm/common/logger.h"
+
+#include <cuda_runtime.h>
+
 #include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <sstream>
 #include <unordered_map>
 #include <vector>
-
-#include <cuda_runtime.h>
-
-#include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/plugins/common/plugin.h"
 
 namespace tensorrt_llm::plugins
 {
 
 struct GemmDims
 {
-    int32_t minM;
-    int32_t maxM;
-    int32_t n;
-    int32_t k;
+    using DimType64 = utils::DimType64;
+
+    DimType64 minM;
+    DimType64 maxM;
+    DimType64 n;
+    DimType64 k;
 
     GemmDims()
         : minM(-1)
@@ -49,7 +51,7 @@ struct GemmDims
     {
     }
 
-    GemmDims(int32_t minM_, int32_t maxM_, int32_t n_, int32_t k_)
+    GemmDims(DimType64 minM_, DimType64 maxM_, DimType64 n_, DimType64 k_)
         : minM(minM_)
         , maxM(maxM_)
         , n(n_)
@@ -57,7 +59,7 @@ struct GemmDims
     {
     }
 
-    bool isInitialized() const
+    [[nodiscard]] bool isInitialized() const
     {
         return minM >= 0 && maxM >= 0 && n >= 0 && k >= 0;
     }
@@ -170,8 +172,6 @@ template <typename Config, typename RunnerPtr, typename GemmIdType, typename Gem
 class GemmPluginProfiler
 {
 public:
-    static constexpr int MAX_PROFILE_M = 8192;
-
     // Map for single GEMM for different Ms (GEMM dimension) to the best config for particular M
     using MProfileMap = std::unordered_map<int, std::optional<Config>>;
     using MProfileMapPtr = std::shared_ptr<MProfileMap>;
@@ -242,6 +242,8 @@ public:
 
     std::optional<Config> getBestConfig(int m, GemmIdType const& gemmId) const;
 
+    virtual int getMaxProfileM() const;
+
 protected:
     virtual void runTactic(int m, int n, int k, Config const& tactic, char* workspace, cudaStream_t const& stream) = 0;
 
@@ -254,7 +256,7 @@ protected:
 
     virtual std::vector<Config> getTactics(int m, int n, int k) const = 0;
 
-    virtual void initTmpData(int m, int n, int k, char* workspace, size_t size, cudaStream_t stream){};
+    virtual void initTmpData(int m, int n, int k, char* workspace, size_t size, cudaStream_t stream);
 
 private:
     void allocateTmpData();

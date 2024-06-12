@@ -13,7 +13,6 @@ import numpy as np
 import safetensors
 import torch
 import torch.nn as nn
-from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from transformers.pytorch_utils import Conv1D
@@ -22,6 +21,7 @@ import tensorrt_llm
 from tensorrt_llm._utils import release_gc
 from tensorrt_llm.layers import MoeConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.convert_utils import load_calib_dataset
 from tensorrt_llm.quantization import QuantAlgo
 
 
@@ -52,6 +52,13 @@ def parse_arguments():
         'By default, we use a single static scaling factor for the GEMM\'s result. '
         'per_channel instead uses a different static scaling factor for each channel. '
         'The latter is usually more accurate, but a little slower.')
+    parser.add_argument(
+        '--calib_dataset',
+        type=str,
+        default='ccdv/cnn_dailymail',
+        help=
+        "The huggingface dataset name or the local directory of the dataset for calibration."
+    )
     parser.add_argument("--dataset_cache_dir",
                         type=str,
                         default=None,
@@ -331,8 +338,8 @@ def capture_activation_range(model,
                     functools.partial(stat_input_hook, name=name)))
 
     for i in tqdm(range(num_samples), desc="calibrating model"):
-        datapoint = dataset['train'][i:i + 1]
-        line = copy.copy(datapoint['article'])
+        datapoint = dataset[i:i + 1]
+        line = copy.copy(datapoint)
         line[0] = line[0] + ' TL;DR: '
         line[0] = line[0].strip()
         line[0] = line[0].replace(" n't", "n't")
@@ -504,76 +511,62 @@ def convert_hf_dbrx(model_params: dict,
         weights[f'{tllm_prex}.post_layernorm.weight'] = post_ln_weight
 
         if moe_config and moe_config.has_moe():
-            # experts mlp w1
-            experts_weights_1 = get_weight(model_params,
-                                           f'{prefix}.ffn.experts.mlp.w1',
-                                           dtype)
-            experts_weights_1 = torch.reshape(experts_weights_1,
-                                              (-1, mlp_hidden_size, num_hidden))
+            # experts mlp w1 -> mlp gate
+            mlp_gate_weight = get_weight(model_params,
+                                         f'{prefix}.ffn.experts.mlp.w1', dtype)
+            mlp_gate_weight = mlp_gate_weight.reshape(-1, mlp_hidden_size,
+                                                      num_hidden)
             if moe_config.tp_mode == MoeConfig.ParallelismMode.TENSOR_PARALLEL:
-                experts_weights_1_proj_w = split_matrix(experts_weights_1,
-                                                        mapping.tp_size,
-                                                        mapping.tp_rank,
-                                                        dim=1)
+                mlp_gate_w = split_matrix(mlp_gate_weight,
+                                          mapping.tp_size,
+                                          mapping.tp_rank,
+                                          dim=1)
             else:
-                experts_weights_1_proj_w = split_matrix(experts_weights_1,
-                                                        mapping.tp_size,
-                                                        mapping.tp_rank,
-                                                        dim=0)
-            # experts mlp v1
-            experts_weights_3 = get_weight(model_params,
-                                           f'{prefix}.ffn.experts.mlp.v1',
-                                           dtype)
-            experts_weights_3 = torch.reshape(experts_weights_3,
-                                              (-1, mlp_hidden_size, num_hidden))
+                mlp_gate_w = split_matrix(mlp_gate_weight,
+                                          mapping.tp_size,
+                                          mapping.tp_rank,
+                                          dim=0)
+            # experts mlp v1 -> mlp fc
+            mlp_fc_weight = get_weight(model_params,
+                                       f'{prefix}.ffn.experts.mlp.v1', dtype)
+            mlp_fc_weight = mlp_fc_weight.reshape(-1, mlp_hidden_size,
+                                                  num_hidden)
             if moe_config.tp_mode == MoeConfig.ParallelismMode.TENSOR_PARALLEL:
-                experts_weights_3_proj_w = split_matrix(experts_weights_3,
-                                                        mapping.tp_size,
-                                                        mapping.tp_rank,
-                                                        dim=1)
+                mlp_fc_w = split_matrix(mlp_fc_weight,
+                                        mapping.tp_size,
+                                        mapping.tp_rank,
+                                        dim=1)
             else:
-                experts_weights_3_proj_w = split_matrix(experts_weights_3,
-                                                        mapping.tp_size,
-                                                        mapping.tp_rank,
-                                                        dim=0)
-            experts_weights_1_proj_w = torch.concat(
-                [experts_weights_3_proj_w, experts_weights_1_proj_w], dim=-2)
+                mlp_fc_w = split_matrix(mlp_fc_weight,
+                                        mapping.tp_size,
+                                        mapping.tp_rank,
+                                        dim=0)
+            mlp_fc_w = torch.concat([mlp_fc_w, mlp_gate_w], dim=-2)
             weights.update(
-                get_tllm_linear_weight(
-                    experts_weights_1_proj_w,
-                    f'{tllm_prex}.mlp.experts_weight_1',
-                    None,
-                    use_weight_only,
-                    plugin_weight_only_quant_type,
-                    postfix="",
-                    quant_scale_name=f'{tllm_prex}.mlp.experts_scale_1'))
+                get_tllm_linear_weight(mlp_fc_w, f'{tllm_prex}.mlp.fc.', None,
+                                       use_weight_only,
+                                       plugin_weight_only_quant_type))
 
-            # experts mlp w2
-            experts_weights_2 = get_weight(model_params,
-                                           f'{prefix}.ffn.experts.mlp.w2',
-                                           dtype)
-            experts_weights_2 = torch.reshape(
-                experts_weights_2,
-                (-1, mlp_hidden_size, num_hidden)).transpose(1, 2)
+            # experts mlp w2 -> mlp proj
+            mlp_proj_weight = get_weight(model_params,
+                                         f'{prefix}.ffn.experts.mlp.w2', dtype)
+            mlp_proj_weight = mlp_proj_weight.reshape(-1, mlp_hidden_size,
+                                                      num_hidden).transpose(
+                                                          1, 2)
             if moe_config.tp_mode == MoeConfig.ParallelismMode.TENSOR_PARALLEL:
-                experts_weights_2_proj_w = split_matrix(experts_weights_2,
-                                                        mapping.tp_size,
-                                                        mapping.tp_rank,
-                                                        dim=2)
+                mlp_proj_w = split_matrix(mlp_proj_weight,
+                                          mapping.tp_size,
+                                          mapping.tp_rank,
+                                          dim=2)
             else:
-                experts_weights_2_proj_w = split_matrix(experts_weights_2,
-                                                        mapping.tp_size,
-                                                        mapping.tp_rank,
-                                                        dim=0)
+                mlp_proj_w = split_matrix(mlp_proj_weight,
+                                          mapping.tp_size,
+                                          mapping.tp_rank,
+                                          dim=0)
             weights.update(
-                get_tllm_linear_weight(
-                    experts_weights_2_proj_w,
-                    f'{tllm_prex}.mlp.experts_weight_2',
-                    None,
-                    use_weight_only,
-                    plugin_weight_only_quant_type,
-                    postfix="",
-                    quant_scale_name=f'{tllm_prex}.mlp.experts_scale_2'))
+                get_tllm_linear_weight(mlp_proj_w, f'{tllm_prex}.mlp.proj.',
+                                       None, use_weight_only,
+                                       plugin_weight_only_quant_type))
 
             # router mlp
             router_weights = get_weight(model_params,
@@ -687,11 +680,16 @@ if __name__ == '__main__':
         'rotary_base': args.rotary_base,
         'rotary_scaling': args.rotary_scaling,
         'quantization': {
-            'quant_algo': quant_algo,
-            'kv_cache_quant_algo': kv_cache_quant_algo,
-            'exclude_modules': ['lm_head'],
+            'quant_algo':
+            quant_algo,
+            'kv_cache_quant_algo':
+            kv_cache_quant_algo,
+            'exclude_modules': [
+                'lm_head', 'vocab_embedding', 'position_embedding',
+                'block_embedding'
+            ],
         },
-        'moe_config': {
+        'moe': {
             "num_experts": args.moe_num_experts,
             "top_k": args.moe_top_k,
             "tp_mode": args.moe_tp_mode,
@@ -703,10 +701,6 @@ if __name__ == '__main__':
             'pp_size': args.pp_size,
         },
         'clip_qkv': args.clip_qkv,
-        'moe_num_experts': args.moe_num_experts,
-        'moe_top_k': args.moe_top_k,
-        'moe_tp_mode': args.moe_tp_mode,
-        'moe_normalization_mode': args.moe_renorm_mode,
         'dense_context_fmha': args.dense_context_fmha,
     }
 
@@ -734,14 +728,12 @@ if __name__ == '__main__':
                           pp_size=args.pp_size)
         act_range = {}
         if args.int8_kv_cache:
-            dataset = load_dataset("ccdv/cnn_dailymail",
-                                   '3.0.0',
-                                   cache_dir=args.dataset_cache_dir)
-            act_range = capture_activation_range(
-                hf_model,
-                AutoTokenizer.from_pretrained(args.model_dir,
-                                              padding_side='left',
-                                              trust_remote_code=True), dataset)
+            tokenizer = AutoTokenizer.from_pretrained(args.model_dir,
+                                                      padding_side='left',
+                                                      trust_remote_code=True)
+            dataset = load_calib_dataset(args.calib_dataset,
+                                         cache_dir=args.dataset_cache_dir)
+            act_range = capture_activation_range(hf_model, tokenizer, dataset)
 
         hf_model = dict(hf_model.named_parameters())
         weights = convert_hf_dbrx(
