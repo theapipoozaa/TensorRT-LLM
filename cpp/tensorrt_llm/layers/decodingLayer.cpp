@@ -182,6 +182,7 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
     auto const localDecoderDomain = getLocalDecoderDomain(params, mDecoderDomain);
     auto const maxSeqLen = baseOutputs->outputIds.shape[baseOutputs->outputIds.shape.size() - 1];
     auto const& endIds = params->endIds;
+    auto const& minPs = params->minPs;
 
     std::shared_ptr<BaseDecodingOutputs> preparedOutputs;
     std::shared_ptr<BaseDecodingInputs> preparedInputs;
@@ -205,7 +206,8 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
         Tensor const logitsSlice{params->logits->slice(
             {localBatchSize, static_cast<size_t>(localDecoderDomain.getBeamWidth()), params->logits->shape[2]}, 0)};
         Tensor const endIdSlice{endIds.slice({localBatchSize}, 0)};
-        auto decodeInputs = std::make_shared<SamplingInputs>(endIdSlice, step, ite, localBatchSize);
+        Tensor const minPSlice{minPs.slice({localBatchSize}, 0)};
+        auto decodeInputs = std::make_shared<SamplingInputs>(endIdSlice, minPSlice, step, ite, localBatchSize);
 
         decodeInputs->finished = params->finished;
 

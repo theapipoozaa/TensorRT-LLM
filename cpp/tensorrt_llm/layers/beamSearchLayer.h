@@ -33,9 +33,9 @@ class BeamSearchInputParams : public DecodingInputs
 {
 public:
     explicit BeamSearchInputParams(runtime::SizeType32 step, runtime::SizeType32 ite, tc::Tensor logits,
-        tc::Tensor endIds, tc::Tensor srcCacheIndirection, runtime::SizeType32 maxAttentionWindow,
+        tc::Tensor endIds, tc::Tensor minPs, tc::Tensor srcCacheIndirection, runtime::SizeType32 maxAttentionWindow,
         runtime::SizeType32 sinkTokenLength, runtime::SizeType32 maxSeqLen, runtime::SizeType32 localBatchSize)
-        : DecodingInputs(std::move(endIds), step, ite, localBatchSize)
+        : DecodingInputs(std::move(endIds), std::move(minPs), step, ite, localBatchSize)
         , logits{std::move(logits)}
         , maxAttentionWindow{maxAttentionWindow}
         , sinkTokenLength{sinkTokenLength}

@@ -221,11 +221,11 @@ void acceptDraftTokensByLogits(T* draftLogits, T** targetLogits, T* draftProbs, 
         invokeAddBiasSoftMax(draftLogits, static_cast<T**>(nullptr), draftProbs, static_cast<T*>(nullptr), nullptr,
             finished, batchSlots, batchSize, maxBatchSize, beamWidth * maxDraftTokens, vocabSize, vocabSizePadded,
             /* skip softmax */ false,
-            /* batchSlotLogits */ true, stream);
+            /* batchSlotLogits */ true, (float*) (nullptr), stream);
         invokeAddBiasSoftMax(static_cast<T*>(nullptr), targetLogits, targetProbs, static_cast<T*>(nullptr), nullptr,
             finished, batchSlots, batchSize, maxBatchSize, beamWidth * maxDraftTokens, vocabSize, vocabSizePadded,
             /* skip softmax */ false,
-            /* batchSlotLogits */ true, stream);
+            /* batchSlotLogits */ true, (float*) (nullptr), stream);
     }
     {
         dim3 block(1024);

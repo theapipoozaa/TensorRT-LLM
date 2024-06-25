@@ -252,11 +252,12 @@ public:
 class DecodingInputs : public BaseDecodingInputs
 {
 public:
-    DecodingInputs(tc::Tensor endIds, runtime::SizeType32 step = 0, runtime::SizeType32 ite = 0,
+    DecodingInputs(tc::Tensor endIds, tc::Tensor minPs, runtime::SizeType32 step = 0, runtime::SizeType32 ite = 0,
         runtime::SizeType32 localBatchSize = 0, runtime::SizeType32 maxAttentionWindow = 0,
         runtime::SizeType32 sinkTokenLength = 0)
         : BaseDecodingInputs(localBatchSize)
         , endIds{std::move(endIds)}
+        , minPs{std::move(minPs)}
         , step{step}
         , ite{ite}
         , maxAttentionWindow{maxAttentionWindow}
@@ -266,6 +267,7 @@ public:
 
     //! [maxBatchSize]
     tc::Tensor endIds;
+    tc::Tensor minPs;
 
     // used only for python runtime
     runtime::SizeType32 step;
@@ -307,8 +309,8 @@ class SamplingInputs : public DecodingInputs
 {
 public:
     explicit SamplingInputs(
-        tc::Tensor endIds, runtime::SizeType32 step, runtime::SizeType32 ite, runtime::SizeType32 localBatchSize)
-        : DecodingInputs{std::move(endIds), step, ite, localBatchSize}
+        tc::Tensor endIds, tc::Tensor minPs, runtime::SizeType32 step, runtime::SizeType32 ite, runtime::SizeType32 localBatchSize)
+        : DecodingInputs{std::move(endIds), std::move(minPs), step, ite, localBatchSize}
     {
     }
 
@@ -325,8 +327,8 @@ public:
 class MedusaDecodingInputs : public DecodingInputs
 {
 public:
-    explicit MedusaDecodingInputs(tc::Tensor endIds, runtime::SizeType32 localBatchSize)
-        : DecodingInputs(std::move(endIds), 0, 0, localBatchSize)
+    explicit MedusaDecodingInputs(tc::Tensor endIds, tc::Tensor minPs, runtime::SizeType32 localBatchSize)
+        : DecodingInputs(std::move(endIds), std::move(minPs), 0, 0, localBatchSize)
     {
     }
 
@@ -344,8 +346,8 @@ public:
 class ExplicitDraftTokensInputs : public DecodingInputs
 {
 public:
-    explicit ExplicitDraftTokensInputs(tc::Tensor endIds, runtime::SizeType32 batchSize)
-        : DecodingInputs(std::move(endIds), 0, 0, batchSize)
+    explicit ExplicitDraftTokensInputs(tc::Tensor endIds, tc::Tensor minPs, runtime::SizeType32 batchSize)
+        : DecodingInputs(std::move(endIds), std::move(minPs), 0, 0, batchSize)
     {
     }
 
@@ -394,8 +396,8 @@ class LookaheadDecodingInputs : public DecodingInputs
     using TensorConstPtr = runtime::ITensor::SharedConstPtr;
 
 public:
-    explicit LookaheadDecodingInputs(tc::Tensor endIds)
-        : DecodingInputs{std::move(endIds)}
+    explicit LookaheadDecodingInputs(tc::Tensor endIds, tc::Tensor minPs)
+        : DecodingInputs{std::move(endIds), std::move(minPs)}
     //, logits{logits}
     {
     }
